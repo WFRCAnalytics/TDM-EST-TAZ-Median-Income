@@ -1,0 +1,683 @@
+---
+title: TAZ & Regional Median Income
+subtitle: Calculating Median Income for Transportation Analysis Zones (TAZ)
+description: This notebook replicates the '_Source - TAZ & Regional Median Income - 2022-03-17.xlsb' tab from the 2024 Socioeconomic Projections Excel file. It calculates the median income for each Traffic Analysis Zone (TAZ) based on household income data and population data.
+author:
+ - name: Pukar Bhandari
+   email: pukar.bhandari@wfrc.utah.gov
+   affiliation:
+     - name: Wasatch Front Regional Council
+       url: "https://wfrc.utah.gov/"
+date: "2025-10-08"
+
+execute:
+   eval: true
+jupyter: python3
+
+format:
+  html:
+    toc: true
+    number-sections: true
+    number-depth: 2
+    html-math-method: katex
+    code-link: true
+    code-tools: true
+    code-fold: true
+    code-summary: "Show the code"
+    # fig-width: 8
+    # fig-height: 5
+    # out-width: "100%"
+    # fig-align: center
+
+title-block-banner: true
+---
+
+## Environment Setup
+
+### Load Libraries
+
+``` python
+!conda install -c conda-forge numpy pandas geopandas matplotlib seaborn python-dotenv openpyxl
+!pip install pygris
+```
+
+```{python}
+# For Analysis
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+# For Visualization
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+import seaborn as sns
+
+# Census data query libraries & modules
+from pygris import block_groups, counties, states
+from pygris.helpers import validate_state
+from pygris.data import get_census
+
+# misc
+import datetime
+import os
+from pathlib import Path
+import requests
+
+from dotenv import load_dotenv
+load_dotenv()
+```
+
+### Environment Variables
+
+```{python}
+PROJECT_CRS = "EPSG:3566"  # NAD83 / UTM zone 12N
+```
+
+::: {.callout-tip}
+**Need a Census API key?** Get one for free at [census.gov/developers](https://api.census.gov/data/key_signup.html).
+
+Create a `.env` file in the project directory and add your Census API key:
+```CENSUS_API_KEY=your-key-here```
+This enables fetching US Census data from the Census API.
+:::
+
+```{python}
+#| eval: false
+
+# Set your API key into environment
+os.environ['CENSUS_API_KEY'] = 'your_api_key_here'
+```
+
+```{python}
+STATE_FIPS = validate_state("UT")
+```
+
+## Fetch Raw Data and Load
+
+### Transportation Analysis Zone
+
+```{python}
+gdf_TAZ = gpd.read_file(
+  r"_data/TAZ/WFv920_TAZ.shp"
+).to_crs(PROJECT_CRS)
+
+gdf_TAZ.explore()
+```
+
+### Consumer Price Index
+
+Data Source: Consumer Price Index for All Urban Consumers (CPI-U) \[Source: [Bureau of Labor Statistics](https://www.bls.gov/cpi/research-series/r-cpi-u-rs-home.htm)\]
+
+```{python}
+# Ensure file exists
+filepath_cpi = Path("_data/bls/r-cpi-u-rs-allitems.xlsx")
+if not filepath_cpi.exists():
+    filepath_cpi.parent.mkdir(parents=True, exist_ok=True)
+    response = requests.get("https://www.bls.gov/cpi/research-series/r-cpi-u-rs-allitems.xlsx")
+    filepath_cpi.write_bytes(response.content)
+
+# Read Excel file directly from URL
+df_CPI = pd.read_excel(
+  filepath_cpi, # File path
+  sheet_name="All items",
+  usecols="A:N", # TODO: update cols later for new data
+  skiprows=5,    # Skip the first two rows
+  engine='openpyxl'  # Specify engine
+)
+
+# display the data
+df_CPI
+```
+
+### ACS_5YR_County
+
+#### Set Census Variables
+
+```{python}
+# Define variables to download
+acs_variables = {
+    'B19013_001E': 'HH_MED_INC',  # Median Household Income in the Past 12 Months (in 2023 Inflation-Adjusted Dollars)
+    'B19013_001M': 'HH_MED_INC_MOE',  # Margin of Error for Median Household Income
+    'B19001_001E': 'HH_TOTAL',  # Total Households
+    'B19001_002E': 'HH_LT_10K',  # Less than $10,000
+    'B19001_003E': 'HH_10_15K',  # $10,000 to $14,999
+    'B19001_004E': 'HH_15_20K',  # $15,000 to $19,999
+    'B19001_005E': 'HH_20_25K',  # $20,000 to $24,999
+    'B19001_006E': 'HH_25_30K',  # $25,000 to $29,999
+    'B19001_007E': 'HH_30_35K',  # $30,000 to $34,999
+    'B19001_008E': 'HH_35_40K',  # $35,000 to $39,999
+    'B19001_009E': 'HH_40_45K',  # $40,000 to $44,999
+    'B19001_010E': 'HH_45_50K',  # $45,000 to $49,999
+    'B19001_011E': 'HH_50_60K',  # $50,000 to $59,999
+    'B19001_012E': 'HH_60_75K',  # $60,000 to $74,999
+    'B19001_013E': 'HH_75_100K',  # $75,000 to $99,999
+    'B19001_014E': 'HH_100_125K',  # $100,000 to $124,999
+    'B19001_015E': 'HH_125_150K',  # $125,000 to $149,999
+    'B19001_016E': 'HH_150_200K',  # $150,000 to $199,999
+    'B19001_017E': 'HH_GT_200K'  # $200,000 or more
+}
+```
+
+#### ACS_5YR_State
+
+```{python}
+# Fetch state boundaries from TIGER/Line shapefiles
+gdf_ut_bound = states(
+  year=2023,
+  cache=True
+).to_crs(PROJECT_CRS)
+
+# Filter for Utah only
+gdf_ut_bound = gdf_ut_bound[gdf_ut_bound['STATEFP'] == str(STATE_FIPS)]
+```
+
+```{python}
+# Fetch Income data from ACS 5-year estimates for Utah
+df_ut_income = get_census(
+  dataset="acs/acs5",
+  year=2023,
+  variables=list(acs_variables.keys()),
+  params={
+      # "key": f"{os.getenv('CENSUS_API_KEY')}", # FIXME: This causes error
+      "for": f"state:{STATE_FIPS}"
+    },
+    return_geoid=True,
+    guess_dtypes=True
+)
+```
+
+```{python}
+# Join ACS data to block group boundaries and transform CRS
+gdf_ut_income = gdf_ut_bound[['GEOID', 'STATEFP', 'NAME', 'geometry']].merge(df_ut_income, on = "GEOID").to_crs(PROJECT_CRS)
+```
+
+```{python}
+# Rename columns
+gdf_ut_income = gdf_ut_income.rename(columns=acs_variables)
+```
+
+```{python}
+# Preview data
+gdf_ut_income
+```
+
+#### ACS_5YR_County
+
+```{python}
+# Fetch county boundaries from TIGER/Line shapefiles
+gdf_county_bound = counties(
+  state=STATE_FIPS,
+  year=2023,
+  cache=True
+).to_crs(PROJECT_CRS)
+
+# Fetch Income data from ACS 5-year estimates for counties in Utah
+df_county_income = get_census(
+  dataset="acs/acs5",
+  year=2023,
+  variables=list(acs_variables.keys()),
+  params={
+      # "key": f"{os.getenv('CENSUS_API_KEY')}", # FIXME: This causes error
+      "for": f"county:*",
+      "in": f"state:{STATE_FIPS}"
+    },
+    return_geoid=True,
+    guess_dtypes=True
+)
+
+# Join ACS data to county boundaries and tranform CRS
+gdf_county_income = gdf_county_bound[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(df_county_income, on = "GEOID").to_crs(PROJECT_CRS)
+
+# Rename columns
+gdf_county_income = gdf_county_income.rename(columns=acs_variables)
+
+# Preview data
+gdf_county_income.head(10)
+```
+
+```{python}
+# Preview the date in an interactive map
+gdf_county_income.explore(column="HH_MED_INC", cmap="YlGnBu", legend=True)
+```
+
+```{python}
+# Data Validity Check: Coefficient of Variation (CV) for Median Household Income
+gdf_county_income['HH_MED_INC_CV'] = (
+  gdf_county_income['HH_MED_INC_MOE'] / 1.645
+) / gdf_county_income['HH_MED_INC'] * 100
+
+gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_MED_INC_MOE', 'HH_MED_INC_CV']].sort_values(by='HH_MED_INC_CV', ascending=False)
+```
+
+#### ACS_5YR_BlockGroup
+
+```{python}
+# Fetch block group boundaries from TIGER/Line shapefiles
+gdf_bg_bound = block_groups(
+  state=STATE_FIPS,
+  year=2023,
+  cache=True
+).to_crs(PROJECT_CRS)
+
+# Fetch Income data from ACS 5-year estimates for block groups in Utah
+df_bg_income = get_census(
+  dataset="acs/acs5",
+  year=2023,
+  variables=list(acs_variables.keys()),
+  params={
+      # "key": f"{os.getenv('CENSUS_API_KEY')}", # FIXME: This causes error
+      "for": f"block group:*",
+      "in": f"state:{STATE_FIPS} county:*"
+    },
+    return_geoid=True,
+    guess_dtypes=True
+)
+
+# Join ACS data to block group boundaries and transform CRS
+gdf_bg_income = gdf_bg_bound[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(df_bg_income, on = "GEOID").to_crs(PROJECT_CRS)
+
+# Rename columns
+gdf_bg_income = gdf_bg_income.rename(columns=acs_variables)
+
+# preview data
+gdf_bg_income.head(10)
+```
+
+```{python}
+# Data Validity Check
+gdf_bg_income[
+    gdf_bg_income["HH_MED_INC"].isna() | (gdf_bg_income["HH_MED_INC"] >= 250000)
+]
+```
+
+#### Chart County Median Income - Scaled by Number of Households
+
+```{python}
+# Create plotting dataframe with selected columns
+df_plot = gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_TOTAL']].copy()
+
+# Rank counties by median household income (highest = rank 1)
+df_plot["Rank"] = df_plot["HH_MED_INC"].rank(
+    method="min",       # assign smallest rank for ties
+    ascending=False     # highest income gets rank 1
+).astype(int)
+
+# Create Region column based on MPO counties
+mpo_counties = ['Summit County', 'Wasatch County', 'Davis County', 'Salt Lake County',
+                'Utah County', 'Weber County', 'Washington County', 'Cache County', 'Iron County']
+
+df_plot['Region'] = df_plot['NAMELSAD'].apply(lambda x: 'MPO' if x in mpo_counties else 'Non-MPO')
+
+df_plot.sort_values(by="Rank")
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as ticker
+from adjustText import adjust_text
+
+# Define color mapping
+color_map = {'MPO': '#843C0C', 'Non-MPO': '#4472C4'}
+
+# Set the style
+sns.set_style("whitegrid")
+
+# Create figure
+plt.figure(figsize=(10, 6.5))
+
+# Create scatter plot with hue for automatic color separation
+sns.scatterplot(
+    data=df_plot,
+    x='Rank',
+    y='HH_MED_INC',
+    size='HH_TOTAL',
+    sizes=(100, 10000),
+    hue='Region',
+    palette=color_map,
+    alpha=0.3,
+    edgecolor=df_plot['Region'].map(color_map),
+    linewidth=2.5,
+    legend=False
+)
+
+# Add smooth trend line
+sns.regplot(
+    data=df_plot,
+    x='Rank',
+    y='HH_MED_INC',
+    scatter=False,
+    order=3,
+    ci=None,
+    color='red',
+    line_kws={'linestyle':':', 'dashes':(1, 1), 'linewidth':2, 'alpha':0.8}
+)
+
+# Create list to store text objects
+texts = []
+
+# Add labels for each county with color based on Region
+for idx, row in df_plot.iterrows():
+    county_name = row['NAMELSAD'].replace(' County', '').upper()
+    income_label = f"${row['HH_MED_INC']:,.0f}"
+    label = f"{county_name}\n{income_label}"
+    label_color = color_map[row['Region']]
+
+    text = plt.text(
+        row['Rank'],
+        row['HH_MED_INC'],
+        label,
+        fontsize=7,
+        ha='center',
+        va='center',
+        fontweight='bold',
+        color=label_color
+    )
+    texts.append(text)
+
+# Adjust text positions to avoid overlap
+adjust_text(
+    texts,
+    arrowprops=dict(arrowstyle='->', color='gray', lw=0.5, alpha=0.6),
+    # expand_points=(100, 100),  # Increased from (1.5, 1.5)
+    # expand_text=(100, 100),    # Added to expand text bounding boxes
+    # force_text=(100, 100),     # Increased from (0.5, 0.5)
+    # force_points=(100, 100),   # Increased from (0.3, 0.3)
+    lim=500                    # Increased iteration limit for better placement
+)
+
+# Add horizontal line at median income
+state_avg = gdf_ut_income['HH_MED_INC'].values[0]
+plt.axhline(y=state_avg, color='#C00000', linestyle='--', linewidth=2, alpha=0.4)
+
+# Add text annotations for state average
+plt.text(29.5, state_avg + 1500, 'State Average', fontsize=10, color='#C00000',
+         ha='right', va='bottom', fontweight='bold')
+plt.text(29.5, state_avg - 1500, 'State of Utah', fontsize=10, color='#C00000',
+         ha='right', va='top', fontweight='bold')
+
+# Set axis limits and ticks
+plt.xlim(0, 30)
+plt.ylim(0, 150000)
+plt.xticks(range(0, 31, 5))
+
+# Format y-axis
+plt.gca().yaxis.set_major_locator(ticker.MultipleLocator(20000))
+plt.gca().yaxis.set_minor_locator(ticker.MultipleLocator(10000))
+plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+
+# Customize grid
+plt.grid(True, which='major', axis='y', alpha=0.4, linewidth=0.8, color='gray')
+plt.grid(True, which='minor', axis='y', alpha=0.2, linewidth=0.5, color='gray')
+
+# Set labels and title
+plt.xlabel('Rank', fontsize=12, fontweight='bold', color='#595959')
+plt.ylabel('Median Household Income', fontsize=12, fontweight='bold', color='#595959')
+plt.title('Median Income in 2023 Dollars', fontsize=16, fontweight='bold', pad=20, color='#595959')
+plt.gca().text(0.5, 1.02, 'Source: 2019-2023 American Community Survey',
+               transform=plt.gca().transAxes, ha='center', fontsize=10.5,
+               color='#595959', style='italic')
+
+plt.tight_layout()
+plt.show()
+```
+
+### BlockSplit_wCOTAZID
+
+```{python}
+
+```
+
+
+## Lookup Tables
+
+### ACS Column ID to Label
+
+```{python}
+lookup_hhinc = pd.DataFrame({
+  "Income Category": [
+    "HH_LT_10K", "HH_10_15K", "HH_15_20K", "HH_20_25K", "HH_25_30K", "HH_30_35K",
+    "HH_35_40K", "HH_40_45K", "HH_45_50K", "HH_50_60K", "HH_60_75K",
+    "HH_75_100K", "HH_100_125K", "HH_125_150K", "HH_150_200K", "HH_GT_200K"
+  ],
+  "Lower Limit": [
+    0, 10000, 15000, 20000, 25000, 30000,
+    35000, 40000, 45000, 50000, 60000,
+    75000, 100000, 125000, 150000, 200000
+  ],
+  "Upper Limit": [
+    9999, 14999, 19999, 24999, 29999, 34999,
+    39999, 44999, 49999, 59999, 74999,
+    99999, 124999, 149999, 199999, np.inf
+  ]
+})
+
+# Compute midpoint and round it
+lookup_hhinc['Midpoint'] = (
+  (lookup_hhinc['Lower Limit'] + lookup_hhinc['Upper Limit']) / 2
+).round()
+
+# Replace infinite midpoint (last category) with 300000
+lookup_hhinc.loc[np.isinf(lookup_hhinc["Upper Limit"]), "Midpoint"] = 300000
+
+lookup_hhinc
+```
+
+### BlockGroupID for TAZ Centroid (Use if No HH in TAZ)
+
+```{python}
+# Define a function for population weighted interpolation
+def interpolate_pw(from_gdf, to_gdf, weights_gdf, to_id=None, extensive=True,
+                   weight_column=None, weight_placement='surface', crs=None):
+    """
+    Population-weighted areal interpolation between geometries.
+
+    Transfers numeric data from source geometries to target geometries using
+    population-weighted interpolation based on point weights (e.g., census blocks).
+
+    Parameters:
+    -----------
+    from_gdf : GeoDataFrame
+        Source geometries with numeric data to interpolate
+    to_gdf : GeoDataFrame
+        Target geometries to interpolate data to
+    weights_gdf : GeoDataFrame
+        Weight geometries (e.g., census blocks) used for interpolation.
+        If polygons, will be converted to points. Can be the same as to_gdf.
+    to_id : str, optional
+        Column name for unique identifier in target geometries.
+        If None, creates an 'id' column.
+    extensive : bool, default True
+        If True, return weighted sums (for counts).
+        If False, return weighted means (for rates/percentages).
+    weight_column : str, optional
+        Column name in weights_gdf for weighting (e.g., 'POP', 'HH').
+        If None, all weights are equal.
+    weight_placement : str, default 'surface'
+        How to convert polygons to points: 'surface' or 'centroid'
+    crs : str or CRS object, optional
+        Coordinate reference system to project all datasets to
+
+    Returns:
+    --------
+    GeoDataFrame
+        Target geometries with interpolated numeric values
+    """
+    import warnings
+    import geopandas as gpd
+    import pandas as pd
+
+    # Input validation
+    if not all(isinstance(gdf, gpd.GeoDataFrame) for gdf in [from_gdf, to_gdf, weights_gdf]):
+        raise ValueError("All inputs must be GeoDataFrames")
+
+    # Make copies to avoid modifying originals
+    from_gdf = from_gdf.copy()
+    to_gdf = to_gdf.copy()
+    weights_gdf = weights_gdf.copy()
+
+    # Set CRS if provided
+    if crs:
+        from_gdf = from_gdf.to_crs(crs)
+        to_gdf = to_gdf.to_crs(crs)
+        weights_gdf = weights_gdf.to_crs(crs)
+
+    # Check CRS consistency
+    if not (from_gdf.crs == to_gdf.crs == weights_gdf.crs):
+        raise ValueError("All inputs must have the same CRS")
+
+    # Handle to_id
+    if to_id is None:
+        to_id = 'id'
+        to_gdf[to_id] = to_gdf.index.astype(str)
+
+    # Remove conflicting columns
+    if to_id in from_gdf.columns:
+        from_gdf = from_gdf.drop(columns=[to_id])
+
+    # Create unique from_id
+    from_id = 'from_id'
+    from_gdf[from_id] = from_gdf.index.astype(str)
+
+    # Handle weight column
+    if weight_column is None:
+        weight_column = 'interpolation_weight'
+        weights_gdf[weight_column] = 1.0
+    else:
+        # Rename to avoid conflicts
+        weights_gdf['interpolation_weight'] = weights_gdf[weight_column]
+        weight_column = 'interpolation_weight'
+
+    # Convert weights to points if needed
+    if weights_gdf.geometry.geom_type.iloc[0] in ['Polygon', 'MultiPolygon']:
+        if weight_placement == 'surface':
+            weights_gdf = weights_gdf.copy()
+            weights_gdf.geometry = weights_gdf.geometry.representative_point()
+        elif weight_placement == 'centroid':
+            weights_gdf = weights_gdf.copy()
+            weights_gdf.geometry = weights_gdf.geometry.centroid
+        else:
+            raise ValueError("weight_placement must be 'surface' or 'centroid'")
+
+    # Keep only weight column and geometry
+    weight_points = weights_gdf[[weight_column, 'geometry']].copy()
+
+    # Calculate denominators (total weights per source geometry)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        source_weights = gpd.sjoin(from_gdf, weight_points, how='left', predicate='contains')
+
+    denominators = (source_weights.groupby(from_id)[weight_column]
+                   .sum()
+                   .reset_index()
+                   .rename(columns={weight_column: 'weight_total'}))
+
+    # Calculate intersections between from and to
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        intersections = gpd.overlay(from_gdf, to_gdf, how='intersection')
+
+    # Filter to keep only polygon intersections
+    intersections = intersections[intersections.geometry.geom_type.isin(['Polygon', 'MultiPolygon', 'GeometryCollection'])]
+
+    if len(intersections) == 0:
+        raise ValueError("No valid polygon intersections found between source and target geometries")
+
+    # Add intersection ID
+    intersections['intersection_id'] = range(len(intersections))
+
+    # Spatial join intersections with weight points to get weights within each intersection
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        intersection_weights = gpd.sjoin(intersections, weight_points, how='left', predicate='contains')
+
+    # Calculate intersection values (sum of weights per intersection)
+    intersection_values = (intersection_weights.groupby('intersection_id')[weight_column]
+                         .sum()
+                         .reset_index()
+                         .rename(columns={weight_column: 'intersection_value'}))
+
+    # Merge back to intersections and keep only unique intersections
+    intersections = intersections.merge(intersection_values, on='intersection_id', how='left')
+    intersections['intersection_value'] = intersections['intersection_value'].fillna(0)
+
+    # Remove duplicates created by the spatial join
+    intersections = intersections.drop_duplicates(subset='intersection_id')
+
+    # Merge with denominators to calculate weight coefficients
+    intersections = intersections.merge(denominators, on=from_id, how='left')
+    intersections['weight_total'] = intersections['weight_total'].fillna(1)
+
+    # Calculate weight coefficients (intersection weight / total weight in source)
+    intersections.loc[intersections['weight_total'] > 0, 'weight_coef'] = (
+        intersections['intersection_value'] / intersections['weight_total']
+    )
+    intersections['weight_coef'] = intersections['weight_coef'].fillna(0)
+
+    # Get numeric columns from source data
+    numeric_cols = from_gdf.select_dtypes(include=[np.number]).columns
+    # Remove ID columns
+    numeric_cols = [col for col in numeric_cols if col not in [from_id]]
+
+    # Prepare intersection data for interpolation
+    intersection_data = intersections[[from_id, to_id, 'weight_coef'] + numeric_cols].copy()
+
+    if extensive:
+        # For extensive variables: multiply by weight coefficient, then sum by target
+        for col in numeric_cols:
+            intersection_data[col] = intersection_data[col] * intersection_data['weight_coef']
+
+        interpolated = (intersection_data.groupby(to_id)[numeric_cols]
+                       .sum()
+                       .reset_index())
+    else:
+        # For intensive variables: weighted average
+        interpolated_data = []
+        for target_id in intersection_data[to_id].unique():
+            target_data = intersection_data[intersection_data[to_id] == target_id]
+            if len(target_data) > 0 and target_data['weight_coef'].sum() > 0:
+                weighted_vals = {}
+                for col in numeric_cols:
+                    weighted_vals[col] = (target_data[col] * target_data['weight_coef']).sum() / target_data['weight_coef'].sum()
+                weighted_vals[to_id] = target_id
+                interpolated_data.append(weighted_vals)
+
+        interpolated = pd.DataFrame(interpolated_data)
+
+    # Merge with target geometries
+    result = to_gdf[[to_id, 'geometry']].merge(interpolated, on=to_id, how='left')
+
+    # Fill NaN values with 0 for missing interpolations
+    for col in numeric_cols:
+        if col in result.columns:
+            result[col] = result[col].fillna(0)
+
+    return result
+```
+
+## Processing
+
+
+
+### Process_ACS_BG
+
+
+
+### Process_BlockSplit
+
+
+
+### Calc_TAZ_MedInc
+
+
+
+## Export_MedInc
+
+### TAZ Median Income (SE Files)
+
+```{python}
+gdf_TAZ[['CO_TAZID', 'SUBAREAID', 'CO_FIPS', 'CO_NAME']]
+```
+
+### Regional Median Income (General Parameters)
