@@ -1,7 +1,7 @@
 ---
 title: TAZ & Regional Median Income
 subtitle: Calculating Median Income for Transportation Analysis Zones (TAZ)
-description: This notebook replicates the '_Source - TAZ & Regional Median Income - 2022-03-17.xlsb' tab from the 2024 Socioeconomic Projections Excel file. It calculates the median income for each Traffic Analysis Zone (TAZ) based on household income data and population data.
+description: This notebook replicates the '_Source - TAZ & Regional Median Income - 2022-03-17.xlsb' tab from the 2019-2023 American Community Survey. It calculates the median income for each Traffic Analysis Zone (TAZ) based on household income data and household data.
 author:
  - name: Pukar Bhandari
    email: pukar.bhandari@wfrc.utah.gov
