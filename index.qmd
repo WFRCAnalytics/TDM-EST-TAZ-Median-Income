@@ -100,10 +100,17 @@ STATE_FIPS = validate_state("UT")
 
 ```{python}
 gdf_TAZ = gpd.read_file(
-  r"_data/TAZ/USTMv4_TAZ_20250729_WGS84.geojson"
+  r"_data/TAZ/Statewide_TAZ.zip"
 ).to_crs(PROJECT_CRS)
 
-gdf_TAZ.explore()
+gdf_TAZ.head()
+```
+
+```{python}
+#| eval: false
+
+# Preview the TAZ in an interactive map
+gdf_TAZ.explore(column="CO_TAZID", cmap="tab20", legend=True)
 ```
 
 ### Consumer Price Index
@@ -286,6 +293,8 @@ gdf_bg_income.head(10)
 ```
 
 ```{python}
+#| eval: false
+
 # Preview the date in an interactive map
 gdf_bg_income.explore(column="HH_MED_INC", cmap="YlGnBu", legend=True)
 ```
@@ -424,199 +433,6 @@ plt.show()
 ```
 
 ### BlockSplit_wCOTAZID
-
-```{python}
-#| eval: false
-
-# Define a function for population weighted interpolation
-def interpolate_pw(from_gdf, to_gdf, weights_gdf, to_id=None, extensive=True,
-                   weight_column=None, weight_placement='surface', crs=None):
-    """
-    Population-weighted areal interpolation between geometries.
-
-    Transfers numeric data from source geometries to target geometries using
-    population-weighted interpolation based on point weights (e.g., census blocks).
-
-    Parameters:
-    -----------
-    from_gdf : GeoDataFrame
-        Source geometries with numeric data to interpolate
-    to_gdf : GeoDataFrame
-        Target geometries to interpolate data to
-    weights_gdf : GeoDataFrame
-        Weight geometries (e.g., census blocks) used for interpolation.
-        If polygons, will be converted to points. Can be the same as to_gdf.
-    to_id : str, optional
-        Column name for unique identifier in target geometries.
-        If None, creates an 'id' column.
-    extensive : bool, default True
-        If True, return weighted sums (for counts).
-        If False, return weighted means (for rates/percentages).
-    weight_column : str, optional
-        Column name in weights_gdf for weighting (e.g., 'POP', 'HH').
-        If None, all weights are equal.
-    weight_placement : str, default 'surface'
-        How to convert polygons to points: 'surface' or 'centroid'
-    crs : str or CRS object, optional
-        Coordinate reference system to project all datasets to
-
-    Returns:
-    --------
-    GeoDataFrame
-        Target geometries with interpolated numeric values
-    """
-    import warnings
-    import geopandas as gpd
-    import pandas as pd
-
-    # Input validation
-    if not all(isinstance(gdf, gpd.GeoDataFrame) for gdf in [from_gdf, to_gdf, weights_gdf]):
-        raise ValueError("All inputs must be GeoDataFrames")
-
-    # Make copies to avoid modifying originals
-    from_gdf = from_gdf.copy()
-    to_gdf = to_gdf.copy()
-    weights_gdf = weights_gdf.copy()
-
-    # Set CRS if provided
-    if crs:
-        from_gdf = from_gdf.to_crs(crs)
-        to_gdf = to_gdf.to_crs(crs)
-        weights_gdf = weights_gdf.to_crs(crs)
-
-    # Check CRS consistency
-    if not (from_gdf.crs == to_gdf.crs == weights_gdf.crs):
-        raise ValueError("All inputs must have the same CRS")
-
-    # Handle to_id
-    if to_id is None:
-        to_id = 'id'
-        to_gdf[to_id] = to_gdf.index.astype(str)
-
-    # Remove conflicting columns
-    if to_id in from_gdf.columns:
-        from_gdf = from_gdf.drop(columns=[to_id])
-
-    # Create unique from_id
-    from_id = 'from_id'
-    from_gdf[from_id] = from_gdf.index.astype(str)
-
-    # Handle weight column
-    if weight_column is None:
-        weight_column = 'interpolation_weight'
-        weights_gdf[weight_column] = 1.0
-    else:
-        # Rename to avoid conflicts
-        weights_gdf['interpolation_weight'] = weights_gdf[weight_column]
-        weight_column = 'interpolation_weight'
-
-    # Convert weights to points if needed
-    if weights_gdf.geometry.geom_type.iloc[0] in ['Polygon', 'MultiPolygon']:
-        if weight_placement == 'surface':
-            weights_gdf = weights_gdf.copy()
-            weights_gdf.geometry = weights_gdf.geometry.representative_point()
-        elif weight_placement == 'centroid':
-            weights_gdf = weights_gdf.copy()
-            weights_gdf.geometry = weights_gdf.geometry.centroid
-        else:
-            raise ValueError("weight_placement must be 'surface' or 'centroid'")
-
-    # Keep only weight column and geometry
-    weight_points = weights_gdf[[weight_column, 'geometry']].copy()
-
-    # Calculate denominators (total weights per source geometry)
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=UserWarning)
-        source_weights = gpd.sjoin(from_gdf, weight_points, how='left', predicate='contains')
-
-    denominators = (source_weights.groupby(from_id)[weight_column]
-                   .sum()
-                   .reset_index()
-                   .rename(columns={weight_column: 'weight_total'}))
-
-    # Calculate intersections between from and to
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=UserWarning)
-        intersections = gpd.overlay(from_gdf, to_gdf, how='intersection')
-
-    # Filter to keep only polygon intersections
-    intersections = intersections[intersections.geometry.geom_type.isin(['Polygon', 'MultiPolygon', 'GeometryCollection'])]
-
-    if len(intersections) == 0:
-        raise ValueError("No valid polygon intersections found between source and target geometries")
-
-    # Add intersection ID
-    intersections['intersection_id'] = range(len(intersections))
-
-    # Spatial join intersections with weight points to get weights within each intersection
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=UserWarning)
-        intersection_weights = gpd.sjoin(intersections, weight_points, how='left', predicate='contains')
-
-    # Calculate intersection values (sum of weights per intersection)
-    intersection_values = (intersection_weights.groupby('intersection_id')[weight_column]
-                         .sum()
-                         .reset_index()
-                         .rename(columns={weight_column: 'intersection_value'}))
-
-    # Merge back to intersections and keep only unique intersections
-    intersections = intersections.merge(intersection_values, on='intersection_id', how='left')
-    intersections['intersection_value'] = intersections['intersection_value'].fillna(0)
-
-    # Remove duplicates created by the spatial join
-    intersections = intersections.drop_duplicates(subset='intersection_id')
-
-    # Merge with denominators to calculate weight coefficients
-    intersections = intersections.merge(denominators, on=from_id, how='left')
-    intersections['weight_total'] = intersections['weight_total'].fillna(1)
-
-    # Calculate weight coefficients (intersection weight / total weight in source)
-    intersections.loc[intersections['weight_total'] > 0, 'weight_coef'] = (
-        intersections['intersection_value'] / intersections['weight_total']
-    )
-    intersections['weight_coef'] = intersections['weight_coef'].fillna(0)
-
-    # Get numeric columns from source data
-    numeric_cols = from_gdf.select_dtypes(include=[np.number]).columns
-    # Remove ID columns
-    numeric_cols = [col for col in numeric_cols if col not in [from_id]]
-
-    # Prepare intersection data for interpolation
-    intersection_data = intersections[[from_id, to_id, 'weight_coef'] + numeric_cols].copy()
-
-    if extensive:
-        # For extensive variables: multiply by weight coefficient, then sum by target
-        for col in numeric_cols:
-            intersection_data[col] = intersection_data[col] * intersection_data['weight_coef']
-
-        interpolated = (intersection_data.groupby(to_id)[numeric_cols]
-                       .sum()
-                       .reset_index())
-    else:
-        # For intensive variables: weighted average
-        interpolated_data = []
-        for target_id in intersection_data[to_id].unique():
-            target_data = intersection_data[intersection_data[to_id] == target_id]
-            if len(target_data) > 0 and target_data['weight_coef'].sum() > 0:
-                weighted_vals = {}
-                for col in numeric_cols:
-                    weighted_vals[col] = (target_data[col] * target_data['weight_coef']).sum() / target_data['weight_coef'].sum()
-                weighted_vals[to_id] = target_id
-                interpolated_data.append(weighted_vals)
-
-        interpolated = pd.DataFrame(interpolated_data)
-
-    # Merge with target geometries
-    result = to_gdf[[to_id, 'geometry']].merge(interpolated, on=to_id, how='left')
-
-    # Fill NaN values with 0 for missing interpolations
-    for col in numeric_cols:
-        if col in result.columns:
-            result[col] = result[col].fillna(0)
-
-    return result
-```
-
 
 ## Lookup Tables
 
@@ -885,6 +701,10 @@ gdf_block_centroids['geometry'] = gdf_block_centroids.geometry.centroid
 ```
 
 ```{python}
+#| eval: false
+
+# Run this if CO_FIPS and CO_NAME doesn't exist in TAZ file
+
 # Spatial join TAZ with county boundaries to get county information
 gdf_TAZ = gpd.sjoin(
     gdf_TAZ,
@@ -903,7 +723,6 @@ gdf_TAZ = gdf_TAZ.drop(columns=['index_right', 'COUNTYFP', 'NAMELSAD'])
 
 ```{python}
 # Refine the format for ID columns
-gdf_TAZ["CO_IDX"] = gdf_TAZ["CO_IDX"].astype(int)
 gdf_TAZ["CO_TAZID"] = gdf_TAZ["CO_TAZID"].astype(int)
 gdf_TAZ["SUBAREAID"] = gdf_TAZ["SUBAREAID"].astype(int)
 gdf_TAZ["CO_FIPS"] = gdf_TAZ["CO_FIPS"].astype(int)
@@ -948,6 +767,20 @@ taz_aggregated['MedInc'] = np.where(
 taz_aggregated.head(10)
 ```
 
+```{python}
+# Visualize the distribution of TAZ median incomes
+gdf_TAZ[['CO_TAZID', 'geometry']].merge(
+    taz_aggregated[['CO_TAZID', 'SUBAREAID', 'CO_FIPS', 'CO_NAME', 'MedInc', 'HH23']],
+    on='CO_TAZID',
+    how='left'
+).explore(
+    column="MedInc",
+    cmap="YlGnBu",
+    legend=True,
+    tooltip=["CO_TAZID", "MedInc", "HH23"]
+)
+```
+
 ## Export_MedInc
 
 - Format final TAZ output
@@ -967,6 +800,8 @@ gdf_taz_income = taz_aggregated[[
 
 gdf_taz_income.head(10)
 ```
+
+
 
 ```{python}
 # Create output directory if it doesn't exist
