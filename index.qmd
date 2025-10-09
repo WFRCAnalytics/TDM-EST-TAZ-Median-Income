@@ -100,7 +100,7 @@ STATE_FIPS = validate_state("UT")
 
 ```{python}
 gdf_TAZ = gpd.read_file(
-  r"_data/TAZ/WFv920_TAZ.shp"
+  r"_data/TAZ/USTMv4_TAZ_20250729_WGS84.geojson"
 ).to_crs(PROJECT_CRS)
 
 gdf_TAZ.explore()
@@ -248,7 +248,7 @@ gdf_county_income['HH_MED_INC_CV'] = (
   gdf_county_income['HH_MED_INC_MOE'] / 1.645
 ) / gdf_county_income['HH_MED_INC'] * 100
 
-gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_MED_INC_MOE', 'HH_MED_INC_CV']].sort_values(by='HH_MED_INC_CV', ascending=False)
+gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_MED_INC_MOE', 'HH_MED_INC_CV']].sort_values(by='HH_MED_INC_CV', ascending=False).head(10)
 ```
 
 #### ACS_5YR_BlockGroup
@@ -381,7 +381,7 @@ for idx, row in df_plot.iterrows():
 # Adjust text positions to avoid overlap
 adjust_text(
     texts,
-    arrowprops=dict(arrowstyle='->', color='gray', lw=0.5, alpha=0.6, shrinkA=5, shrinkB=5),
+    arrowprops=dict(arrowstyle='->', color='gray', lw=0.5, alpha=0.6, shrinkA=10, shrinkB=10),
     # expand_points=(100, 100),  # Increased from (1.5, 1.5)
     # expand_text=(100, 100),    # Added to expand text bounding boxes
     # force_text=(100, 100),     # Increased from (0.5, 0.5)
@@ -882,6 +882,31 @@ gdf_block_final.head(10)
 # Convert blocks to centroids
 gdf_block_centroids = gdf_block_final.copy()
 gdf_block_centroids['geometry'] = gdf_block_centroids.geometry.centroid
+```
+
+```{python}
+# Spatial join TAZ with county boundaries to get county information
+gdf_TAZ = gpd.sjoin(
+    gdf_TAZ,
+    gdf_county_bound[['COUNTYFP', 'NAMELSAD', 'geometry']],
+    how='left',
+    predicate='intersects'
+)
+
+# Rename and keep only necessary columns
+gdf_TAZ['CO_FIPS'] = gdf_TAZ['COUNTYFP']
+gdf_TAZ['CO_NAME'] = gdf_TAZ['NAMELSAD'].str.replace(' County', '').str.upper()
+
+# Drop the extra columns from the join
+gdf_TAZ = gdf_TAZ.drop(columns=['index_right', 'COUNTYFP', 'NAMELSAD'])
+```
+
+```{python}
+# Refine the format for ID columns
+gdf_TAZ["CO_IDX"] = gdf_TAZ["CO_IDX"].astype(int)
+gdf_TAZ["CO_TAZID"] = gdf_TAZ["CO_TAZID"].astype(int)
+gdf_TAZ["SUBAREAID"] = gdf_TAZ["SUBAREAID"].astype(int)
+gdf_TAZ["CO_FIPS"] = gdf_TAZ["CO_FIPS"].astype(int)
 ```
 
 ```{python}
