@@ -434,6 +434,109 @@ plt.tight_layout()
 plt.show()
 ```
 
+```{python}
+# Create scatter plot: County Median Income vs Median of Block Group Median Incomes
+# Calculate median of block group median incomes for each county
+bg_median_by_county = gdf_bg_income[
+    gdf_bg_income['HH_MED_INC'].notna()
+].groupby('COUNTYFP')['HH_MED_INC'].median().reset_index()
+bg_median_by_county.columns = ['COUNTYFP', 'BG_MedianOfMedians']
+
+# Merge with county data
+plot_data = gdf_county_income[['COUNTYFP', 'NAMELSAD', 'HH_MED_INC']].merge(
+    bg_median_by_county,
+    on='COUNTYFP',
+    how='left'
+)
+
+# Filter out missing values
+plot_data = plot_data[
+    (plot_data['HH_MED_INC'].notna()) &
+    (plot_data['BG_MedianOfMedians'].notna())
+].copy()
+
+# Set style
+sns.set_style("whitegrid")
+
+# Create figure
+plt.figure(figsize=(10, 8))
+
+# Create scatter plot
+sns.scatterplot(
+    data=plot_data,
+    x='BG_MedianOfMedians',
+    y='HH_MED_INC',
+    alpha=0.6,
+    s=150,
+    color='#4472C4',
+    edgecolor='#4472C4',
+    linewidth=2,
+    legend=False
+)
+
+# Add regression line
+sns.regplot(
+    data=plot_data,
+    x='BG_MedianOfMedians',
+    y='HH_MED_INC',
+    scatter=False,
+    color='#C00000',
+    line_kws={
+        'linestyle': '--',
+        'linewidth': 2,
+        'alpha': 0.7,
+        'label': 'Trend line'
+    },
+    ci=None
+)
+
+# Add diagonal reference line (y=x)
+min_val = min(plot_data['BG_MedianOfMedians'].min(), plot_data['HH_MED_INC'].min())
+max_val = max(plot_data['BG_MedianOfMedians'].max(), plot_data['HH_MED_INC'].max())
+plt.plot([min_val, max_val], [min_val, max_val],
+         color='gray',
+         linestyle=':',
+         linewidth=1.5,
+         alpha=0.5,
+         label='y=x (perfect match)')
+
+# Add county labels
+for idx, row in plot_data.iterrows():
+    county_name = row['NAMELSAD'].replace(' County', '')
+    plt.annotate(
+        county_name,
+        xy=(row['BG_MedianOfMedians'], row['HH_MED_INC']),
+        xytext=(5, 5),
+        textcoords='offset points',
+        fontsize=8,
+        alpha=0.7
+    )
+
+# Format axes
+plt.gca().xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x/1000:.0f}K'))
+plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x/1000:.0f}K'))
+
+# Labels and title
+plt.xlabel('Median of Block Group Median Incomes', fontsize=12, fontweight='bold', color='#595959')
+plt.ylabel('County Median Income', fontsize=12, fontweight='bold', color='#595959')
+plt.title('County Median Income vs Median of Block Group Median Incomes',
+          fontsize=14, fontweight='bold', pad=15, color='#595959')
+
+# Add legend
+plt.legend(loc='lower right', fontsize=9)
+
+# Add correlation coefficient and sample size
+corr = plot_data['BG_MedianOfMedians'].corr(plot_data['HH_MED_INC'])
+plt.text(0.02, 0.98, f'Correlation: {corr:.3f}\nn={len(plot_data)} counties',
+         transform=plt.gca().transAxes,
+         fontsize=10,
+         verticalalignment='top',
+         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+plt.tight_layout()
+plt.show()
+```
+
 ### BlockSplit_wCOTAZID
 
 ## Lookup Tables
@@ -585,11 +688,27 @@ df_bg_income_process['Median Income'] = np.select(medinc_conditions, medinc_choi
 # Create final processed dataset
 df_bg_income_process = df_bg_income_process[[
     'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC',
-    'EstMedInc', 'County_MedInc', 'Flag', 'Median Income',
+    'EstMedInc', 'County_MedInc', 'Flag', 'Median Income'
 ]].copy()
 
 # Display summary
 df_bg_income_process.head(10)
+```
+
+```{python}
+#| eval: false
+
+# Explore the processed block group median income data
+gdf_bg_bound[['GEOID', 'geometry']].merge(
+    df_bg_income_process,
+    on='GEOID',
+    how='left'
+).explore(
+    column="Median Income",
+    cmap="YlGnBu",
+    legend=True,
+    tooltip=["GEOID", "NAMELSAD", "HH_TOTAL", "Median Income", "Flag"]
+)
 ```
 
 ### Process_BlockSplit
@@ -702,7 +821,7 @@ gdf_block_centroids = gdf_block_final.copy()
 gdf_block_centroids['geometry'] = gdf_block_centroids.geometry.centroid
 ```
 
-```{python}
+```python
 #| eval: false
 
 # Run this if CO_FIPS and CO_NAME doesn't exist in TAZ file
@@ -755,11 +874,11 @@ taz_aggregated = gdf_block_with_taz.groupby('CO_TAZID').agg({
     'CO_NAME': 'first',
     'HH23': 'sum',
     'HH_MedInc_Product': 'sum',
-    'Median Income': 'mean'
+    'Median Income': 'median'  # For fallback if HH23 = 0
 }).reset_index()
 
 # Calculate TAZ median income using weighted mean
-# If HH > 0, use weighted mean; otherwise use simple mean
+# If HH > 0, use weighted mean; otherwise use median
 taz_aggregated['MedInc'] = np.where(
     taz_aggregated['HH23'] > 0,
     (taz_aggregated['HH_MedInc_Product'] / taz_aggregated['HH23']).round(0),
@@ -802,8 +921,6 @@ gdf_taz_income = taz_aggregated[[
 
 gdf_taz_income.head(10)
 ```
-
-
 
 ```{python}
 # Create output directory if it doesn't exist
