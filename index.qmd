@@ -821,7 +821,7 @@ gdf_block_centroids = gdf_block_final.copy()
 gdf_block_centroids['geometry'] = gdf_block_centroids.geometry.centroid
 ```
 
-```python
+```{python}
 #| eval: false
 
 # Run this if CO_FIPS and CO_NAME doesn't exist in TAZ file
@@ -880,7 +880,7 @@ taz_aggregated = gdf_block_with_taz.groupby('CO_TAZID').agg({
 # Calculate TAZ median income using weighted mean
 # If HH > 0, use weighted mean; otherwise use median
 taz_aggregated['MedInc'] = np.where(
-    taz_aggregated['HH23'] > 0,
+    taz_aggregated['HH23'].notna() & (taz_aggregated['HH23'] > 0),
     (taz_aggregated['HH_MedInc_Product'] / taz_aggregated['HH23']).round(0),
     taz_aggregated['Median Income'].round(0)
 )
