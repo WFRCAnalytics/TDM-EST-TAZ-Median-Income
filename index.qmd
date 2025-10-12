@@ -16,6 +16,9 @@ jupyter: python3
 
 format:
   html:
+    theme:
+        light: flatly
+        dark: darkly
     toc: true
     number-sections: true
     number-depth: 2
