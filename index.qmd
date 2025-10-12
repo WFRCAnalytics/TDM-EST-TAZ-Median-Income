@@ -989,4 +989,6 @@ gdf_regional_income.to_csv(
 )
 ```
 
-**Download the output files:** [taz_median_income.csv](./_output/taz_median_income.csv) | [regional_median_income.csv](./_output/regional_median_income.csv)
+::: {.callout-tip title="Download the output files:"}
+[taz_median_income.csv](./_output/taz_median_income.csv) | [regional_median_income.csv](./_output/regional_median_income.csv)
+:::
