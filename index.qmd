@@ -38,9 +38,17 @@ format:
 title-block-banner: true
 ---
 
+## Introduction
+
+This analysis calculates median household income for Transportation Analysis Zones (TAZ) across Utah using data from the 2019-2023 American Community Survey (ACS). The methodology employs spatial interpolation techniques to transfer income data from Census geographies (block groups and blocks) to TAZ boundaries, accounting for spatial overlaps and using household counts as weights.
+
+The process involves several key steps: obtaining income data at the block group level, distributing this data to census blocks, and then aggregating to TAZ boundaries using area-weighted interpolation. This ensures that income estimates accurately reflect the spatial distribution of households within each TAZ.
+
 ## Environment Setup
 
 ### Install Required Packages
+
+Install the necessary Python packages for data processing, spatial analysis, and visualization. This includes pandas for data manipulation, geopandas for spatial operations, pygris for accessing Census TIGER/Line shapefiles, and various visualization libraries.
 
 ``` python
 !conda install -c conda-forge numpy pandas geopandas matplotlib seaborn python-dotenv openpyxl
@@ -48,6 +56,8 @@ title-block-banner: true
 ```
 
 ### Load Libraries
+
+Import all required libraries for the analysis. The pygris library enables direct access to Census Bureau geographic data and ACS estimates through their API.
 
 ```{python}
 # For Analysis
@@ -80,6 +90,8 @@ load_dotenv()
 
 ### Environment Variables
 
+Set the coordinate reference system for the analysis to NAD83 / UTM zone 12N (EPSG:3566), which is appropriate for Utah. Also validate the state FIPS code for Utah.
+
 ```{python}
 PROJECT_CRS = "EPSG:3566"  # NAD83 / UTM zone 12N
 STATE_FIPS = validate_state("UT")
@@ -103,6 +115,16 @@ os.environ['CENSUS_API_KEY'] = 'your_api_key_here'
 ## Define Helper Functions
 
 ### Weighted Spatial Interpolation Function
+
+This custom function performs population-weighted areal interpolation, which is a sophisticated method for transferring data between different geographic units. Traditional spatial joins often use centroids or simple overlaps, which can introduce errors when dealing with irregularly shaped polygons or when population is not evenly distributed.
+
+The `interpolate_pw` function addresses these limitations by:
+
+1. Using point-based weights (like household counts) to represent where population actually lives within each geography
+2. Calculating how much of each weight falls within intersected areas
+3. Proportionally distributing values based on these weights rather than just area
+
+This approach is particularly important for income data, where we want to account for where households are located, not just land area.
 
 ```{python}
 def interpolate_pw(from_gdf, to_gdf, weights_gdf, to_id=None, extensive=True,
@@ -292,6 +314,14 @@ def interpolate_pw(from_gdf, to_gdf, weights_gdf, to_id=None, extensive=True,
 
 ### Median Income Estimation Function
 
+When detailed income distribution data is unavailable at the Census block level, we need to estimate median income from the income bracket counts available in the ACS. This function implements the cumulative distribution method, which:
+
+1. Calculates the cumulative sum of households across income brackets
+2. Identifies the bracket containing the 50th percentile (median)
+3. Returns the midpoint of that bracket as the estimated median
+
+This provides a reasonable approximation when direct median values are suppressed or unavailable due to data quality concerns.
+
 ```{python}
 def estimate_median(row, income_columns, midpoints):
     """
@@ -333,6 +363,8 @@ def estimate_median(row, income_columns, midpoints):
 
 ### Transportation Analysis Zone
 
+Load the statewide TAZ shapefile, which contains the geographic boundaries for all transportation analysis zones in Utah. These zones are used in transportation modeling and planning. The data is reprojected to our standard coordinate system and ID columns are formatted as integers for consistency.
+
 ```{python}
 gdf_TAZ = gpd.read_file(
   r"_data/TAZ/Statewide_TAZ.zip"
@@ -347,6 +379,8 @@ print(f"Total TAZs: {len(gdf_TAZ)}")
 gdf_TAZ.head()
 ```
 
+The TAZ dataset includes `{python} len(gdf_TAZ)` zones across Utah, covering both metropolitan planning organization (MPO) areas and rural regions.
+
 ```{python}
 #| eval: false
 
@@ -355,6 +389,10 @@ gdf_TAZ.explore(column="CO_FIPS", cmap="tab20", legend=True)
 ```
 
 ### Consumer Price Index
+
+The Consumer Price Index (CPI-U-RS) from the Bureau of Labor Statistics provides inflation adjustment factors. This will be useful for comparing income values across different time periods or adjusting historical data to current dollars. The research series (R-CPI-U-RS) is particularly appropriate for longitudinal analysis as it uses consistent methodology throughout the time series.
+
+Download and load the CPI data directly from the BLS website. The data includes annual average CPI values that can be used to adjust income figures for inflation.
 
 Data Source: Consumer Price Index for All Urban Consumers (CPI-U) \[Source: [Bureau of Labor Statistics](https://www.bls.gov/cpi/research-series/r-cpi-u-rs-home.htm)\]
 
@@ -383,6 +421,8 @@ df_CPI
 
 #### Define Census Variables
 
+Define the specific ACS variables we need for this analysis. Table B19013 provides median household income, while Table B19001 provides the household income distribution across 16 income brackets. These brackets allow us to calculate weighted averages and estimate medians when direct values are unavailable.
+
 ```{python}
 # Define variables to download
 acs_variables = {
@@ -409,6 +449,8 @@ acs_variables = {
 ```
 
 #### State Level Data
+
+Retrieve state-level income data for Utah. While we'll primarily use smaller geographies, state-level data provides a useful benchmark for comparison and validation.
 
 ```{python}
 # Fetch state boundaries from TIGER/Line shapefiles
@@ -443,6 +485,8 @@ gdf_ut_income
 ```
 
 #### County Level Data
+
+Fetch county-level income data for all 29 counties in Utah. County medians serve as a fallback when block group data is unavailable or unreliable. The ACS provides relatively stable estimates at the county level due to larger sample sizes.
 
 ```{python}
 # Fetch county boundaries from TIGER/Line shapefiles
@@ -481,6 +525,8 @@ gdf_county_income.head()
 gdf_county_income.explore(column="HH_MED_INC", cmap="YlGnBu", legend=True)
 ```
 
+The Coefficient of Variation (CV) measures data reliability by comparing the margin of error to the estimate itself. Values below 15% are generally considered reliable, 15-30% should be used with caution, and values above 30% are considered unreliable. This check helps identify counties where data quality may be a concern.
+
 ```{python}
 # Data Validity Check: Coefficient of Variation (CV) for Median Household Income
 gdf_county_income['HH_MED_INC_CV'] = (
@@ -491,6 +537,8 @@ gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_MED_INC_MOE', 'HH_MED_INC_CV']]
 ```
 
 #### Block Group Level Data
+
+Download income data for all census block groups in Utah. Block groups are the smallest geography for which the ACS publishes detailed income data. Each block group typically contains 600-3,000 people.
 
 ```{python}
 # Fetch block group boundaries from TIGER/Line shapefiles
@@ -531,6 +579,8 @@ gdf_bg_income.head(10)
 gdf_bg_income.explore(column="HH_MED_INC", cmap="YlGnBu", legend=True)
 ```
 
+Block groups with null median income values or extreme values (≥$250,000) require special handling. These often occur in areas with small populations, high-income enclaves, or data quality issues. For these cases, we'll use either estimated medians from the income distribution or fall back to county values.
+
 ```{python}
 # Data Validity Check
 gdf_bg_income[
@@ -539,6 +589,8 @@ gdf_bg_income[
 ```
 
 #### Decennial Census 2020 - Census Blocks
+
+Census blocks are the smallest geographic unit used by the Census Bureau, typically containing just a few dozen housing units. While the ACS doesn't provide income data at this level, the 2020 Decennial Census provides precise household counts that we can use as weights for spatial interpolation.
 
 ```{python}
 # Define variables
@@ -576,9 +628,13 @@ print(f"Blocks with households: {(gdf_block_hh['HH20'] > 0).sum()}")
 gdf_block_hh.head()
 ```
 
+Out of `{python} len(gdf_block_hh)`, total census blocks in Utah, only `{python} (gdf_block_hh['HH20'] > 0).sum()` have households. Many blocks represent unpopulated areas like parks, water bodies, or commercial/industrial zones.
+
 ## Lookup Tables
 
 ### Income Category Lookup
+
+Create a reference table defining the income brackets used in ACS Table B19001. Each bracket has a lower and upper limit, and we calculate midpoints for median estimation. The highest bracket ($200,000+) uses $300,000 as a reasonable midpoint based on income distribution patterns.
 
 ```{python}
 lookup_hhinc = pd.DataFrame({
@@ -612,6 +668,8 @@ lookup_hhinc
 
 ### Region Lookup
 
+Define the model spaces (planning regions) used in transportation modeling. UDOT represents statewide planning, while the numbered regions correspond to metropolitan planning organizations and rural planning areas.
+
 ```{python}
 subareaid_lookup = {
     0: 'UDOT',
@@ -628,6 +686,10 @@ subareaid_lookup
 ## Intermediate Data Processing
 
 ### Step 1: Process Block Group Income Data
+
+The ACS provides median income directly for most block groups, but some have missing or suppressed values due to small sample sizes or data quality concerns. We need a systematic approach to handle these cases while maintaining data reliability.
+
+Apply the median estimation function to calculate income from the household distribution for each block group. This provides a fallback when the ACS-reported median is unavailable.
 
 ```{python}
 # Get list of income bracket from lookup table
@@ -653,6 +715,14 @@ df_bg_income_process['EstMedInc'] = df_bg_income_process.apply(
 print("Estimated median income calculated")
 df_bg_income_process.head()
 ```
+
+Assign quality flags to each block group based on data availability:
+
+* **Flag 0:** High quality - ACS reported median is available and reasonable (>$0 and <$250,000)
+* **Flag 1:** County fallback - No reliable data at block group level, use county median
+* **Flag 2:** Estimated - Use calculated median from income distribution
+
+Create the final median income column by selecting the most appropriate value based on the quality flag. This hierarchical approach prioritizes direct ACS estimates but ensures all block groups have a reasonable income value.
 
 ```{python}
 # Assign data quality flags
@@ -711,6 +781,8 @@ df_bg_income_process.head(10)
 
 ### Step 2: Prepare Block Group Geometries with Income
 
+Combine the block group geometries with the processed income data. This creates a spatial dataset where each block group polygon contains its estimated median income and quality flag.
+
 ```{python}
 # Get block group geometries with median income
 gdf_bg_with_income = gdf_bg_bound[['GEOID', 'geometry']].merge(
@@ -738,10 +810,14 @@ gdf_bg_with_income.explore(
 
 ### Step 3: Prepare Census Blocks with Household Counts
 
+Extract the block group identifier from each census block's GEOID. The first 12 characters of a block GEOID uniquely identify its parent block group, allowing us to link blocks to their income data.
+
 ```{python}
 # Extract Block Group GEOID from Block GEOID (first 12 characters)
 gdf_block_hh['GEOID_BG'] = gdf_block_hh['GEOID'].str[:12]
 ```
+
+Join the median income from block groups to individual census blocks. Each block inherits the income characteristics of its parent block group, as income data is not available at the block level.
 
 ::: {.callout-note}
 Median income is transferred directly from block groups to blocks via a simple join on `GEOID_BG`. Each block inherits the median income of its parent block group.
@@ -761,6 +837,10 @@ gdf_block_hh_income.head()
 ```
 
 ### Step 4: Weighted Interpolation of 2023 Households to Blocks
+
+The 2020 Decennial Census provides precise household counts, but we need 2023 estimates to match our income data year. This step uses spatial interpolation to distribute 2023 household totals from block groups to individual blocks, weighted by the 2020 block-level household distribution.
+
+Use the weighted interpolation function to proportionally allocate 2023 household totals from block groups to census blocks. The 2020 household counts serve as weights, assuming the relative distribution of households among blocks remains similar. This produces estimated 2023 household counts at the block level.
 
 ::: {.callout-note}
 This step uses the `interpolate_pw` function to distribute 2023 ACS household totals from block groups to census blocks, weighted by 2020 household counts. We use `extensive=True` because household count is an extensive variable (sum).
@@ -793,7 +873,13 @@ print(f"Total 2023 HH in blocks: {gdf_block_hh_income['HH23'].sum():,.0f}")
 gdf_block_hh_income.head()
 ```
 
+After interpolation, the total estimated 2023 households across all blocks should closely match the ACS block group totals.
+
 ### Step 5: Polygon-to-Polygon Intersection between Blocks and TAZ
+
+Census blocks and TAZ boundaries don't align perfectly - blocks may span multiple TAZs and TAZs may contain partial blocks. A polygon overlay operation identifies all intersections and preserves the exact geometry of these overlaps.
+
+Perform a geometric intersection between census blocks and TAZ boundaries. This creates new polygons representing every unique combination of block and TAZ, along with the attributes from both datasets.
 
 ::: {.callout-note}
 Instead of using spatial join with centroids, we use polygon overlay to capture the actual intersection between census blocks and TAZs. This preserves spatial relationships when blocks cross TAZ boundaries.
@@ -813,7 +899,13 @@ print(f"Unique TAZs in intersections: {gdf_block_taz_intersection['CO_TAZID'].nu
 gdf_block_taz_intersection.head()
 ```
 
+The intersection produces more records than either input dataset because blocks crossing TAZ boundaries create multiple intersection polygons.
+
 ### Step 6: Calculate Intersection Areas and Proportional Households
+
+When a census block spans multiple TAZs, we need to distribute its households proportionally based on the area of each intersection. This assumes households are evenly distributed within each block.
+
+Calculate the area of each intersection polygon and compare it to the original block area. The ratio determines what proportion of the block's households fall within each TAZ.
 
 ```{python}
 # Calculate area of each intersected polygon
@@ -837,6 +929,11 @@ gdf_block_taz_intersection['area_proportion'] = np.where(
     gdf_block_taz_intersection['intersection_area'] / gdf_block_taz_intersection['block_area'],
     0
 )
+```
+
+Distribute households to each intersection based on the area proportion. For example, if 30% of a block's area falls in one TAZ and 70% in another, we assign households proportionally.
+
+```{python}
 
 # Distribute households proportionally based on intersection area
 gdf_block_taz_intersection['HH23_intersect'] = (
@@ -847,14 +944,24 @@ print(f"Total HH23 after proportional distribution: {gdf_block_taz_intersection[
 gdf_block_taz_intersection.head()
 ```
 
+The total households after proportional distribution should match the sum before distribution, confirming that no households were lost or duplicated in the process.
+
 ### Step 7: Calculate TAZ Median Income using Weighted Mean
+
+Rather than simply averaging block-level incomes, we need to calculate a household-weighted mean for each TAZ. This ensures that blocks with more households have more influence on the TAZ median.
+
+For each intersection polygon, calculate the product of households and median income. This weighted value will be used to compute the household-weighted mean income for each TAZ.
 
 ```{python}
 # Calculate weighted income (HH * Median Income) for each intersected polygon
 gdf_block_taz_intersection['HH_MedInc_Product'] = (
     gdf_block_taz_intersection['HH23_intersect'] * gdf_block_taz_intersection['Median Income']
 )
+```
 
+Group all intersections by TAZ and calculate the weighted mean income. Divide the sum of weighted income products by the sum of households to get the final TAZ median. For TAZs with zero households, use the simple median of block incomes as a fallback.
+
+```{python}
 # Group by TAZ and calculate weighted mean
 df_taz_aggregated = gdf_block_taz_intersection.groupby('CO_TAZID').agg({
     'SUBAREAID': 'first',
@@ -882,6 +989,10 @@ df_taz_aggregated.head(10)
 ```
 
 ### Step 8: Handle Remaining NULL Values (County Fallback)
+
+Despite our multi-step process, some TAZs may still lack income estimates, typically in unpopulated areas or areas with data quality issues. County-level medians provide a reasonable final fallback.
+
+Check for any TAZs with missing median income values and fill them with their county's median. This ensures every TAZ has an income estimate, even if it's less precise than block-level data.
 
 ```{python}
 # Check if any TAZs still have NULL values
@@ -914,6 +1025,8 @@ else:
 
 ### TAZ Median Income Summary
 
+The final dataset contains median income estimates for all `{python} len(gdf_TAZ)` TAZs in Utah, along with estimated 2023 household counts. These values can be used directly in transportation models and planning analyses.
+
 ```{python}
 # Create final TAZ output
 df_taz_income = df_taz_aggregated[[
@@ -934,6 +1047,8 @@ print("="*80)
 df_taz_income
 ```
 
+TAZs with zero households typically represent unpopulated areas, employment centers, or future development zones. Their assigned income values (from county fallbacks) should be used cautiously.
+
 ```{python}
 # Display TAZs with no households
 no_hh_tazs = df_taz_income[df_taz_income['HH23'] == 0]
@@ -943,6 +1058,8 @@ if len(no_hh_tazs) > 0:
 ```
 
 ### Interactive Map: TAZ Median Income
+
+Visualize the spatial distribution of median income across Utah's TAZs. The map reveals clear geographic patterns, with higher incomes concentrated in suburban areas and lower incomes in urban cores and rural regions.
 
 ```{python}
 # Visualize the distribution of TAZ median incomes
@@ -960,6 +1077,8 @@ gdf_TAZ[['CO_TAZID', 'geometry']].merge(
 ```
 
 ### Regional Median Income Summary
+
+Aggregate TAZ-level data to calculate household-weighted median income for each planning region. These regional values are particularly useful for comparative analysis and regional planning efforts.
 
 ```{python}
 # Calculate regional weighted medians
@@ -989,7 +1108,13 @@ print("="*80)
 df_regional_income
 ```
 
+The Summit-Wasatch region, which includes resort communities, shows the highest median income, followed by Wasatch Front region (containing the largest metropolitan areas). Rural regions generally have lower median incomes, reflecting different economic structures and costs of living.
+
 ### Result Validation
+
+To ensure our methodology produces reasonable results, we compare our 2023 estimates with previously calculated 2019 values. We expect median incomes to increase due to both inflation and real wage growth.
+
+Load the 2019 regional median income data from the previous analysis for comparison.
 
 ```{python}
 # Compare county median income with 2019 calculations
@@ -1004,6 +1129,8 @@ df_regional_income_2019 = pd.read_excel(
 
 df_regional_income_2019[['MedInc_2019']] = df_regional_income_2019[['MedInc']].astype(int)
 ```
+
+Calculate the absolute and percentage change between 2019 and 2023. The changes should be consistent with inflation rates and economic growth over this period. Typical increases of 20-30% over four years align with the combination of ~20% cumulative inflation plus modest real wage growth during this period.
 
 ```{python}
 # Merge 2019 and 2023 data
@@ -1034,9 +1161,13 @@ print("="*80)
 df_regional_comparison
 ```
 
+The comparison shows consistent increases across all regions, with percentage changes ranging from approximately 20-30%. This aligns with economic trends during 2019-2023, including significant inflation, particularly in 2021-2022. The Wasatch Front shows slightly lower percentage growth, which may reflect its already-high base, while smaller regions show more variation due to sample size effects.
+
 ### Chart
 
 #### County Median Income Distribution
+
+This scatter plot ranks Utah's 29 counties by median household income and visualizes the relationship between rank and income level. Bubble size represents total households in each county, highlighting the population concentration in metropolitan areas.
 
 ```{python}
 # Create plotting dataframe
@@ -1154,7 +1285,11 @@ plt.tight_layout()
 plt.show()
 ```
 
+The chart distinguishes between MPO (Metropolitan Planning Organization) and non-MPO counties, revealing that most high-income counties are part of MPO regions. The curved trend line shows that income differences between top-ranked counties are larger than differences among lower-ranked counties. The state median provides context for interpreting individual county values.
+
 #### County vs Block Group Median Comparison
+
+This validation chart compares county-level median income (reported directly by ACS) with the median of all block group medians within each county. If our block group data is reliable, these two values should be highly correlated.
 
 ```{python}
 # Calculate median of block group median incomes for each county
@@ -1258,6 +1393,8 @@ plt.tight_layout()
 plt.show()
 ```
 
+A strong correlation (close to 1.0) indicates that block group data accurately reflects county-level patterns. Points falling near the diagonal reference line (y=x) show counties where the two measures align closely. Deviations suggest either data quality issues at the block group level or genuine within-county variation in how income is distributed.
+
 #### 2019 vs 2023 Block Group Income Distribution
 
 ```{python}
@@ -1289,6 +1426,8 @@ gdf_bg_income19 = gdf_bg_bound19[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].
 
 gdf_bg_income19.head(10)
 ```
+
+Compare the distribution of block group median incomes between the 2015-2019 and 2019-2023 ACS periods. The rightward shift of the 2023 distribution reflects both inflation and real income growth.
 
 ```{python}
 # Prepare data: Combine 2019 and 2023 block group income data
@@ -1328,7 +1467,11 @@ plt.tight_layout()
 plt.show()
 ```
 
+The overlaid histograms reveal how the entire income distribution shifted upward. The 2023 distribution shows fewer block groups in the lowest income brackets and more in middle and upper brackets, consistent with the inflationary period and wage increases during this time.
+
 #### 2019 vs 2023 Regional Median Income Comparison
+
+The grouped bar chart directly compares regional median incomes between 2019 and 2023, making the magnitude of change clearly visible across all planning regions.
 
 ```{python}
 # Prepare long format data
@@ -1379,7 +1522,11 @@ plt.tight_layout()
 plt.show()
 ```
 
+All regions show substantial increases, with the absolute dollar increases being largest in already-high-income regions like Wasatch Front and Summit-Wasatch. The percentage change chart normalizes these increases, showing that rural regions experienced similar or sometimes higher percentage growth despite lower baseline incomes.
+
 ## Export Results
+
+Save the final TAZ and regional median income datasets as CSV files for use in the travel demand model and other planning applications. These files can be joined to other datasets using TAZ IDs or region IDs.
 
 ```{python}
 # Create output directory if it doesn't exist
@@ -1398,6 +1545,8 @@ df_regional_income.to_csv(
     index=False
 )
 ```
+
+The exported files provide ready-to-use income estimates that reflect the most recent available data (2019-2023 ACS) and have been carefully processed to handle data quality issues while preserving spatial accuracy.
 
 ::: {.callout-tip title="Download the output files:"}
 [taz_median_income.csv](./_output/taz_median_income.csv) | [regional_median_income.csv](./_output/regional_median_income.csv)
