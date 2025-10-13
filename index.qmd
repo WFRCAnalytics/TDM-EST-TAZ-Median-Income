@@ -1287,8 +1287,6 @@ gdf_bg_income19 = gdf_bg_bound19[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].
     df_bg_income19, on = "GEOID"
 ).to_crs(PROJECT_CRS).rename(columns=acs_variables)
 
-# preview data
-print(f"Total block groups: {len(gdf_bg_income19)}")
 gdf_bg_income19.head(10)
 ```
 
@@ -1302,10 +1300,6 @@ df_bg_comparison = pd.DataFrame({
     'Year': ['2019'] * gdf_bg_income19['HH_MED_INC'].notna().sum() +
             ['2023'] * gdf_bg_income['HH_MED_INC'].notna().sum()
 })
-
-print(f"2019 Block Groups: {(df_bg_comparison['Year'] == '2019').sum()}")
-print(f"2023 Block Groups: {(df_bg_comparison['Year'] == '2023').sum()}")
-df_bg_comparison.head()
 ```
 
 ```{python}
