@@ -19,6 +19,7 @@ format:
     theme:
         light: flatly
         dark: darkly
+    respect-user-color-scheme: true
     toc: true
     number-sections: true
     number-depth: 2
@@ -39,18 +40,21 @@ title-block-banner: true
 
 ## Environment Setup
 
-### Load Libraries
+### Install Required Packages
 
 ``` python
 !conda install -c conda-forge numpy pandas geopandas matplotlib seaborn python-dotenv openpyxl
-!pip install pygris
+!pip install pygris adjustText
 ```
+
+### Load Libraries
 
 ```{python}
 # For Analysis
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import warnings
 
 # For Visualization
 import matplotlib.pyplot as plt
@@ -62,7 +66,7 @@ from adjustText import adjust_text
 # Census data query libraries & modules
 from pygris import blocks, block_groups, counties, states
 from pygris.helpers import validate_state, validate_county
-from pygris.data import get_census, get_lodes
+from pygris.data import get_census
 
 # misc
 import datetime
@@ -78,6 +82,7 @@ load_dotenv()
 
 ```{python}
 PROJECT_CRS = "EPSG:3566"  # NAD83 / UTM zone 12N
+STATE_FIPS = validate_state("UT")
 ```
 
 ::: {.callout-tip}
@@ -91,12 +96,237 @@ This enables fetching US Census data from the Census API.
 ```{python}
 #| eval: false
 
-# Set your API key into environment
+# Set your API key into environment (alternative to .env file)
 os.environ['CENSUS_API_KEY'] = 'your_api_key_here'
 ```
 
+## Define Helper Functions
+
+### Weighted Spatial Interpolation Function
+
 ```{python}
-STATE_FIPS = validate_state("UT")
+def interpolate_pw(from_gdf, to_gdf, weights_gdf, to_id=None, extensive=True,
+                   weight_column=None, weight_placement='surface', crs=None):
+    """
+    Population-weighted areal interpolation between geometries.
+
+    Transfers numeric data from source geometries to target geometries using
+    population-weighted interpolation based on point weights (e.g., census blocks).
+
+    Parameters:
+    -----------
+    from_gdf : GeoDataFrame
+        Source geometries with numeric data to interpolate
+    to_gdf : GeoDataFrame
+        Target geometries to interpolate data to
+    weights_gdf : GeoDataFrame
+        Weight geometries (e.g., census blocks) used for interpolation.
+        If polygons, will be converted to points. Can be the same as to_gdf.
+    to_id : str, optional
+        Column name for unique identifier in target geometries.
+        If None, creates an 'id' column.
+    extensive : bool, default True
+        If True, return weighted sums (for counts).
+        If False, return weighted means (for rates/percentages).
+    weight_column : str, optional
+        Column name in weights_gdf for weighting (e.g., 'POP', 'HH').
+        If None, all weights are equal.
+    weight_placement : str, default 'surface'
+        How to convert polygons to points: 'surface' or 'centroid'
+    crs : str or CRS object, optional
+        Coordinate reference system to project all datasets to
+
+    Returns:
+    --------
+    GeoDataFrame
+        Target geometries with interpolated numeric values
+    """
+
+    # Input validation
+    if not all(isinstance(gdf, gpd.GeoDataFrame) for gdf in [from_gdf, to_gdf, weights_gdf]):
+        raise ValueError("All inputs must be GeoDataFrames")
+
+    # Make copies to avoid modifying originals
+    from_gdf = from_gdf.copy()
+    to_gdf = to_gdf.copy()
+    weights_gdf = weights_gdf.copy()
+
+    # Set CRS if provided
+    if crs:
+        from_gdf = from_gdf.to_crs(crs)
+        to_gdf = to_gdf.to_crs(crs)
+        weights_gdf = weights_gdf.to_crs(crs)
+
+    # Check CRS consistency
+    if not (from_gdf.crs == to_gdf.crs == weights_gdf.crs):
+        raise ValueError("All inputs must have the same CRS")
+
+    # Handle to_id
+    if to_id is None:
+        to_id = 'id'
+        to_gdf[to_id] = to_gdf.index.astype(str)
+
+    # Remove conflicting columns
+    if to_id in from_gdf.columns:
+        from_gdf = from_gdf.drop(columns=[to_id])
+
+    # Create unique from_id
+    from_id = 'from_id'
+    from_gdf[from_id] = from_gdf.index.astype(str)
+
+    # Handle weight column
+    if weight_column is None:
+        weight_column = 'interpolation_weight'
+        weights_gdf[weight_column] = 1.0
+    else:
+        # Rename to avoid conflicts
+        weights_gdf['interpolation_weight'] = weights_gdf[weight_column]
+        weight_column = 'interpolation_weight'
+
+    # Convert weights to points if needed
+    if weights_gdf.geometry.geom_type.iloc[0] in ['Polygon', 'MultiPolygon']:
+        if weight_placement == 'surface':
+            weights_gdf = weights_gdf.copy()
+            weights_gdf.geometry = weights_gdf.geometry.representative_point()
+        elif weight_placement == 'centroid':
+            weights_gdf = weights_gdf.copy()
+            weights_gdf.geometry = weights_gdf.geometry.centroid
+        else:
+            raise ValueError("weight_placement must be 'surface' or 'centroid'")
+
+    # Keep only weight column and geometry
+    weight_points = weights_gdf[[weight_column, 'geometry']].copy()
+
+    # Calculate denominators (total weights per source geometry)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        source_weights = gpd.sjoin(from_gdf, weight_points, how='left', predicate='contains')
+
+    denominators = (source_weights.groupby(from_id)[weight_column]
+                   .sum()
+                   .reset_index()
+                   .rename(columns={weight_column: 'weight_total'}))
+
+    # Calculate intersections between from and to
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        intersections = gpd.overlay(from_gdf, to_gdf, how='intersection')
+
+    # Filter to keep only polygon intersections
+    intersections = intersections[intersections.geometry.geom_type.isin(['Polygon', 'MultiPolygon', 'GeometryCollection'])]
+
+    if len(intersections) == 0:
+        raise ValueError("No valid polygon intersections found between source and target geometries")
+
+    # Add intersection ID
+    intersections['intersection_id'] = range(len(intersections))
+
+    # Spatial join intersections with weight points to get weights within each intersection
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        intersection_weights = gpd.sjoin(intersections, weight_points, how='left', predicate='contains')
+
+    # Calculate intersection values (sum of weights per intersection)
+    intersection_values = (intersection_weights.groupby('intersection_id')[weight_column]
+                         .sum()
+                         .reset_index()
+                         .rename(columns={weight_column: 'intersection_value'}))
+
+    # Merge back to intersections and keep only unique intersections
+    intersections = intersections.merge(intersection_values, on='intersection_id', how='left')
+    intersections['intersection_value'] = intersections['intersection_value'].fillna(0)
+
+    # Remove duplicates created by the spatial join
+    intersections = intersections.drop_duplicates(subset='intersection_id')
+
+    # Merge with denominators to calculate weight coefficients
+    intersections = intersections.merge(denominators, on=from_id, how='left')
+    intersections['weight_total'] = intersections['weight_total'].fillna(1)
+
+    # Calculate weight coefficients (intersection weight / total weight in source)
+    intersections.loc[intersections['weight_total'] > 0, 'weight_coef'] = (
+        intersections['intersection_value'] / intersections['weight_total']
+    )
+    intersections['weight_coef'] = intersections['weight_coef'].fillna(0)
+
+    # Get numeric columns from source data
+    numeric_cols = from_gdf.select_dtypes(include=[np.number]).columns
+    # Remove ID columns
+    numeric_cols = [col for col in numeric_cols if col not in [from_id]]
+
+    # Prepare intersection data for interpolation
+    intersection_data = intersections[[from_id, to_id, 'weight_coef'] + list(numeric_cols)].copy()
+
+    if extensive:
+        # For extensive variables: multiply by weight coefficient, then sum by target
+        for col in numeric_cols:
+            intersection_data[col] = intersection_data[col] * intersection_data['weight_coef']
+
+        interpolated = (intersection_data.groupby(to_id)[list(numeric_cols)]
+                       .sum()
+                       .reset_index())
+    else:
+        # For intensive variables: weighted average
+        interpolated_data = []
+        for target_id in intersection_data[to_id].unique():
+            target_data = intersection_data[intersection_data[to_id] == target_id]
+            if len(target_data) > 0 and target_data['weight_coef'].sum() > 0:
+                weighted_vals = {}
+                for col in numeric_cols:
+                    weighted_vals[col] = (target_data[col] * target_data['weight_coef']).sum() / target_data['weight_coef'].sum()
+                weighted_vals[to_id] = target_id
+                interpolated_data.append(weighted_vals)
+
+        interpolated = pd.DataFrame(interpolated_data)
+
+    # Merge with target geometries
+    result = to_gdf[[to_id, 'geometry']].merge(interpolated, on=to_id, how='left')
+
+    # Fill NaN values with 0 for missing interpolations
+    for col in numeric_cols:
+        if col in result.columns:
+            result[col] = result[col].fillna(0)
+
+    return result
+```
+
+### Median Income Estimation Function
+
+```{python}
+def estimate_median(row, income_columns, midpoints):
+    """
+    Find median income from household income distribution using cumulative sum method.
+
+    Parameters:
+    -----------
+    row : DataFrame row
+        Row with household counts by income bracket
+    income_columns : list
+        List of column names with HH counts (HH_LT_10K, HH_10_15K, etc.)
+    midpoints : array
+        Array of income bracket midpoints
+
+    Returns:
+    --------
+    float
+        Estimated median income
+    """
+    total_hh = row['HH_TOTAL']
+
+    # Handle edge cases
+    if pd.isna(total_hh) or total_hh == 0:
+        return np.nan
+
+    cumsum = 0
+    for col, midpoint in zip(income_columns, midpoints):
+        # Handle missing values in income brackets
+        hh_count = row[col] if pd.notna(row[col]) else 0
+        cumsum += hh_count
+
+        if cumsum > total_hh / 2:
+            return midpoint
+
+    return 300000  # Default for highest bracket
 ```
 
 ## Raw Data Sources
@@ -108,6 +338,12 @@ gdf_TAZ = gpd.read_file(
   r"_data/TAZ/Statewide_TAZ.zip"
 ).to_crs(PROJECT_CRS)
 
+# Refine the format for ID columns
+gdf_TAZ["CO_TAZID"] = gdf_TAZ["CO_TAZID"].astype(int)
+gdf_TAZ["SUBAREAID"] = gdf_TAZ["SUBAREAID"].astype(int)
+gdf_TAZ["CO_FIPS"] = gdf_TAZ["CO_FIPS"].astype(int)
+
+print(f"Total TAZs: {len(gdf_TAZ)}")
 gdf_TAZ.head()
 ```
 
@@ -115,7 +351,7 @@ gdf_TAZ.head()
 #| eval: false
 
 # Preview the TAZ in an interactive map
-gdf_TAZ.explore(column="CO_TAZID", cmap="tab20", legend=True)
+gdf_TAZ.explore(column="CO_FIPS", cmap="tab20", legend=True)
 ```
 
 ### Consumer Price Index
@@ -143,9 +379,9 @@ df_CPI = pd.read_excel(
 df_CPI
 ```
 
-### ACS_5YR_HouseholdIncome
+### American Community Survey (ACS) 5-Year Estimates
 
-#### Set Census Variables
+#### Define Census Variables
 
 ```{python}
 # Define variables to download
@@ -172,7 +408,7 @@ acs_variables = {
 }
 ```
 
-#### ACS_5YR_State
+#### State Level Data
 
 ```{python}
 # Fetch state boundaries from TIGER/Line shapefiles
@@ -183,9 +419,7 @@ gdf_ut_bound = states(
 
 # Filter for Utah only
 gdf_ut_bound = gdf_ut_bound[gdf_ut_bound['STATEFP'] == str(STATE_FIPS)]
-```
 
-```{python}
 # Fetch Income data from ACS 5-year estimates for Utah
 df_ut_income = get_census(
   dataset="acs/acs5",
@@ -198,24 +432,17 @@ df_ut_income = get_census(
     return_geoid=True,
     guess_dtypes=True
 )
-```
 
-```{python}
 # Join ACS data to block group boundaries and transform CRS
-gdf_ut_income = gdf_ut_bound[['GEOID', 'STATEFP', 'NAME', 'geometry']].merge(df_ut_income, on = "GEOID").to_crs(PROJECT_CRS)
-```
+gdf_ut_income = gdf_ut_bound[['GEOID', 'STATEFP', 'NAME', 'geometry']].merge(
+    df_ut_income, on = "GEOID"
+).to_crs(PROJECT_CRS).rename(columns=acs_variables)
 
-```{python}
-# Rename columns
-gdf_ut_income = gdf_ut_income.rename(columns=acs_variables)
-```
-
-```{python}
 # Preview data
 gdf_ut_income
 ```
 
-#### ACS_5YR_County
+#### County Level Data
 
 ```{python}
 # Fetch county boundaries from TIGER/Line shapefiles
@@ -240,13 +467,13 @@ df_county_income = get_census(
 )
 
 # Join ACS data to county boundaries and tranform CRS
-gdf_county_income = gdf_county_bound[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(df_county_income, on = "GEOID").to_crs(PROJECT_CRS)
-
-# Rename columns
-gdf_county_income = gdf_county_income.rename(columns=acs_variables)
+gdf_county_income = gdf_county_bound[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(
+    df_county_income, on = "GEOID"
+).to_crs(PROJECT_CRS).rename(columns=acs_variables)
 
 # Preview data
-gdf_county_income.head(10)
+print(f"Total counties: {len(gdf_county_income)}")
+gdf_county_income.head()
 ```
 
 ```{python}
@@ -263,7 +490,7 @@ gdf_county_income['HH_MED_INC_CV'] = (
 gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_MED_INC_MOE', 'HH_MED_INC_CV']].sort_values(by='HH_MED_INC_CV', ascending=False).head(10)
 ```
 
-#### ACS_5YR_BlockGroup
+#### Block Group Level Data
 
 ```{python}
 # Fetch block group boundaries from TIGER/Line shapefiles
@@ -288,12 +515,12 @@ df_bg_income = get_census(
 )
 
 # Join ACS data to block group boundaries and transform CRS
-gdf_bg_income = gdf_bg_bound[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(df_bg_income, on = "GEOID").to_crs(PROJECT_CRS)
-
-# Rename columns
-gdf_bg_income = gdf_bg_income.rename(columns=acs_variables)
+gdf_bg_income = gdf_bg_bound[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(
+    df_bg_income, on = "GEOID"
+).to_crs(PROJECT_CRS).rename(columns=acs_variables)
 
 # preview data
+print(f"Total block groups: {len(gdf_bg_income)}")
 gdf_bg_income.head(10)
 ```
 
@@ -311,16 +538,514 @@ gdf_bg_income[
 ]
 ```
 
-#### Chart County Median Income - Scaled by Number of Households
+#### Decennial Census 2020 - Census Blocks
 
 ```{python}
-# Create plotting dataframe with selected columns
+# Define variables
+dec_variables = {
+    'H9_001N': 'HH20'  # Total Number of Households
+}
+
+# Get census block geometries
+gdf_block_bound = blocks(
+    state=STATE_FIPS,
+    year=2020,
+    cache=True
+)
+
+# Download household counts
+df_block_hh = get_census(
+    dataset="dec/dhc",
+    year=2020,
+    variables=list(dec_variables.keys()),
+    params={
+        "for": f"block:*",
+        "in": f"state:{STATE_FIPS} county:*"
+    },
+    return_geoid=True,
+    guess_dtypes=True,
+)
+
+# Join and rename
+gdf_block_hh = gdf_block_bound[['GEOID20', 'geometry']].merge(
+    df_block_hh, left_on="GEOID20", right_on="GEOID"
+).to_crs(PROJECT_CRS).rename(columns=dec_variables)[['GEOID', 'HH20', 'geometry']]
+
+print(f"Total census blocks: {len(gdf_block_hh)}")
+print(f"Blocks with households: {(gdf_block_hh['HH20'] > 0).sum()}")
+gdf_block_hh.head()
+```
+
+## Lookup Tables
+
+### Income Category Lookup
+
+```{python}
+lookup_hhinc = pd.DataFrame({
+  "Income Category": [
+    "HH_LT_10K", "HH_10_15K", "HH_15_20K", "HH_20_25K", "HH_25_30K", "HH_30_35K",
+    "HH_35_40K", "HH_40_45K", "HH_45_50K", "HH_50_60K", "HH_60_75K",
+    "HH_75_100K", "HH_100_125K", "HH_125_150K", "HH_150_200K", "HH_GT_200K"
+  ],
+  "Lower Limit": [
+    0, 10000, 15000, 20000, 25000, 30000,
+    35000, 40000, 45000, 50000, 60000,
+    75000, 100000, 125000, 150000, 200000
+  ],
+  "Upper Limit": [
+    9999, 14999, 19999, 24999, 29999, 34999,
+    39999, 44999, 49999, 59999, 74999,
+    99999, 124999, 149999, 199999, np.inf
+  ]
+})
+
+# Compute midpoint and round it
+lookup_hhinc['Midpoint'] = (
+  (lookup_hhinc['Lower Limit'] + lookup_hhinc['Upper Limit']) / 2
+).round()
+
+# Replace infinite midpoint (last category) with 300000
+lookup_hhinc.loc[np.isinf(lookup_hhinc["Upper Limit"]), "Midpoint"] = 300000
+
+lookup_hhinc
+```
+
+### Region Lookup
+
+```{python}
+subareaid_lookup = {
+    0: 'UDOT',
+    1: 'Wasatch Front',
+    2: 'Cache',
+    3: 'Dixie',
+    4: 'Summit-Wasatch',
+    5: 'Iron'
+}
+
+subareaid_lookup
+```
+
+## Intermediate Data Processing
+
+### Step 1: Process Block Group Income Data
+
+```{python}
+# Get list of income bracket from lookup table
+income_bracket_cols = lookup_hhinc["Income Category"].tolist()
+
+# Get midpoint values from lookup table
+midpoints = lookup_hhinc['Midpoint'].values
+
+# Prepare working dataset
+df_bg_income_process = gdf_bg_income[[
+    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC', 'HH_MED_INC_MOE',
+    *income_bracket_cols
+]].copy()
+
+# Apply the function to each row to calculate estimated median
+df_bg_income_process['EstMedInc'] = df_bg_income_process.apply(
+    estimate_median,
+    axis=1,  # Apply function row-wise
+    income_columns=income_bracket_cols,
+    midpoints=midpoints
+)
+
+print("Estimated median income calculated")
+df_bg_income_process.head()
+```
+
+```{python}
+# Assign data quality flags
+conditions = [
+    # Condition 1: Does the block group have a good ACS reported median?
+    (df_bg_income_process['HH_MED_INC'].notna()) &           # Median exists (not missing)
+    (df_bg_income_process['HH_MED_INC'] > 0) &               # Median is positive
+    (df_bg_income_process['HH_MED_INC'] < 250001),           # Median is reasonable (not extreme)
+
+    # Condition 2: Do we have an estimated median from distribution?
+    df_bg_income_process['EstMedInc'].notna()                # Estimated median exists
+]
+
+df_bg_income_process['Flag'] = np.select(
+    conditions,      # List of conditions to check
+    [0, 2],         # Values to assign: 0 if condition 1 True, 2 if condition 2 True
+    default=1       # If neither condition is True, assign 1
+)
+
+# Join county median for fallback
+df_bg_income_process = df_bg_income_process.merge(
+    gdf_county_income[['COUNTYFP', 'HH_MED_INC']].rename(columns={'HH_MED_INC': 'County_MedInc'}),
+    on='COUNTYFP',
+    how='left'
+)
+
+# Create final median income column based on flag
+medinc_conditions = [
+    df_bg_income_process['Flag'] == 0,
+    df_bg_income_process['Flag'] == 1,
+    df_bg_income_process['Flag'] == 2
+]
+
+medinc_choices = [
+    df_bg_income_process['HH_MED_INC'], # ACS Reported block group household Income
+    df_bg_income_process['County_MedInc'], # County fallback if none is true
+    df_bg_income_process['EstMedInc'] # Estimated median fallback if ACS reported doesnt exist
+]
+
+df_bg_income_process['Median Income'] = np.select(medinc_conditions, medinc_choices, default=np.nan)
+```
+
+```{python}
+# Create final processed dataset
+df_bg_income_process = df_bg_income_process[[
+    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC',
+    'EstMedInc', 'County_MedInc', 'Flag', 'Median Income'
+]].copy()
+
+# Add GEOID_BG column
+df_bg_income_process['GEOID_BG'] = df_bg_income_process['GEOID']
+
+# Display summary
+df_bg_income_process.head(10)
+```
+
+### Step 2: Prepare Block Group Geometries with Income
+
+```{python}
+# Get block group geometries with median income
+gdf_bg_with_income = gdf_bg_bound[['GEOID', 'geometry']].merge(
+    df_bg_income_process[['GEOID_BG', "NAMELSAD", "HH_TOTAL", "Median Income", "Flag"]],
+    left_on='GEOID',
+    right_on='GEOID_BG',
+    how='inner'
+).to_crs(PROJECT_CRS)
+
+print(f"Block groups with income data: {len(gdf_bg_with_income)}")
+gdf_bg_with_income.head()
+```
+
+```{python}
+#| eval: false
+
+# Explore the processed block group median income data
+gdf_bg_with_income.explore(
+    column="Median Income",
+    cmap="YlGnBu",
+    legend=True,
+    tooltip=["GEOID", "NAMELSAD", "HH_TOTAL", "Median Income", "Flag"]
+)
+```
+
+### Step 3: Prepare Census Blocks with Household Counts
+
+```{python}
+# Extract Block Group GEOID from Block GEOID (first 12 characters)
+gdf_block_hh['GEOID_BG'] = gdf_block_hh['GEOID'].str[:12]
+```
+
+::: {.callout-note}
+Median income is transferred directly from block groups to blocks via a simple join on `GEOID_BG`. Each block inherits the median income of its parent block group.
+:::
+
+```{python}
+# Join median income from block groups to blocks
+gdf_block_hh_income = gdf_block_hh.merge(
+    df_bg_income_process[['GEOID_BG', 'Median Income']],
+    on='GEOID_BG',
+    how='left'
+)
+
+print(f"Blocks after join: {len(gdf_block_hh_income)}")
+print(f"Blocks with median income: {gdf_block_hh_income['Median Income'].notna().sum()}")
+gdf_block_hh_income.head()
+```
+
+### Step 4: Weighted Interpolation of 2023 Households to Blocks
+
+::: {.callout-note}
+This step uses the `interpolate_pw` function to distribute 2023 ACS household totals from block groups to census blocks, weighted by 2020 household counts. We use `extensive=True` because household count is an extensive variable (sum).
+:::
+
+```{python}
+# Use weighted interpolation to transfer HH_TOTAL from BG to blocks
+gdf_blocks_hh23 = interpolate_pw(
+    from_gdf=gdf_bg_with_income[['GEOID_BG', 'HH_TOTAL', 'geometry']],
+    to_gdf=gdf_block_hh[['GEOID', 'geometry']],
+    weights_gdf=gdf_block_hh[['GEOID', 'HH20', 'geometry']],
+    to_id='GEOID',
+    extensive=True,  # Extensive variable - sum households
+    weight_column='HH20',
+    weight_placement='centroid',
+    crs=PROJECT_CRS
+)
+
+# Merge interpolated households with the blocks that have median income
+gdf_block_hh_income = gdf_block_hh_income.merge(
+    gdf_blocks_hh23[['GEOID', 'HH_TOTAL']].rename(columns={'HH_TOTAL': 'HH23'}),
+    on='GEOID',
+    how='left'
+)
+
+# Round and convert to integer
+gdf_block_hh_income['HH23'] = gdf_block_hh_income['HH23'].round(0).astype(int).fillna(0)
+
+print(f"Total 2023 HH in blocks: {gdf_block_hh_income['HH23'].sum():,.0f}")
+gdf_block_hh_income.head()
+```
+
+### Step 5: Polygon-to-Polygon Intersection between Blocks and TAZ
+
+::: {.callout-note}
+Instead of using spatial join with centroids, we use polygon overlay to capture the actual intersection between census blocks and TAZs. This preserves spatial relationships when blocks cross TAZ boundaries.
+:::
+
+```{python}
+# Perform polygon-to-polygon intersection
+gdf_block_taz_intersection = gpd.overlay(
+    gdf_block_hh_income[['GEOID', 'GEOID_BG', 'HH20', 'HH23', 'Median Income', 'geometry']],
+    gdf_TAZ[['CO_TAZID', 'SUBAREAID', 'CO_FIPS', 'CO_NAME', 'geometry']],
+    how='intersection'
+)
+
+print(f"Total intersected polygons: {len(gdf_block_taz_intersection):,}")
+print(f"Unique blocks in intersections: {gdf_block_taz_intersection['GEOID'].nunique():,}")
+print(f"Unique TAZs in intersections: {gdf_block_taz_intersection['CO_TAZID'].nunique():,}")
+gdf_block_taz_intersection.head()
+```
+
+### Step 6: Calculate Intersection Areas and Proportional Households
+
+```{python}
+# Calculate area of each intersected polygon
+gdf_block_taz_intersection['intersection_area'] = gdf_block_taz_intersection.geometry.area
+
+# Calculate original block areas
+block_areas = gdf_block_hh_income[['GEOID', 'geometry']].copy()
+block_areas['block_area'] = block_areas.geometry.area
+block_areas = block_areas[['GEOID', 'block_area']]
+
+# Merge block areas
+gdf_block_taz_intersection = gdf_block_taz_intersection.merge(
+    block_areas,
+    on='GEOID',
+    how='left'
+)
+
+# Calculate proportion of block area within each intersection
+gdf_block_taz_intersection['area_proportion'] = np.where(
+    gdf_block_taz_intersection['block_area'] > 0,
+    gdf_block_taz_intersection['intersection_area'] / gdf_block_taz_intersection['block_area'],
+    0
+)
+
+# Distribute households proportionally based on intersection area
+gdf_block_taz_intersection['HH23_intersect'] = (
+    gdf_block_taz_intersection['HH23'] * gdf_block_taz_intersection['area_proportion']
+).round(0)
+
+print(f"Total HH23 after proportional distribution: {gdf_block_taz_intersection['HH23_intersect'].sum():,.0f}")
+gdf_block_taz_intersection.head()
+```
+
+### Step 7: Calculate TAZ Median Income using Weighted Mean
+
+```{python}
+# Calculate weighted income (HH * Median Income) for each intersected polygon
+gdf_block_taz_intersection['HH_MedInc_Product'] = (
+    gdf_block_taz_intersection['HH23_intersect'] * gdf_block_taz_intersection['Median Income']
+)
+
+# Group by TAZ and calculate weighted mean
+df_taz_aggregated = gdf_block_taz_intersection.groupby('CO_TAZID').agg({
+    'SUBAREAID': 'first',
+    'CO_FIPS': 'first',
+    'CO_NAME': 'first',
+    'HH23_intersect': 'sum',
+    'HH_MedInc_Product': 'sum',
+    'Median Income': 'median'  # For fallback if HH23 = 0
+}).reset_index()
+
+# Rename column for clarity
+df_taz_aggregated = df_taz_aggregated.rename(columns={'HH23_intersect': 'HH23'})
+
+# Calculate TAZ median income using weighted mean
+df_taz_aggregated['MedInc'] = np.where(
+    df_taz_aggregated['HH23'].notna() & (df_taz_aggregated['HH23'] > 0),
+    (df_taz_aggregated['HH_MedInc_Product'] / df_taz_aggregated['HH23']).round(0),
+    df_taz_aggregated['Median Income'].round(0)
+)
+
+print(f"\nTotal TAZs: {len(df_taz_aggregated)}")
+print(f"TAZs with median income: {df_taz_aggregated['MedInc'].notna().sum()}")
+print(f"TAZs with NULL median income: {df_taz_aggregated['MedInc'].isna().sum()}")
+df_taz_aggregated.head(10)
+```
+
+### Step 8: Handle Remaining NULL Values (County Fallback)
+
+```{python}
+# Check if any TAZs still have NULL values
+if df_taz_aggregated['MedInc'].isna().any():
+    print(f"Applying county median fallback for {df_taz_aggregated['MedInc'].isna().sum()} TAZs...")
+
+    # Get county medians
+    county_medians = gdf_county_income[['COUNTYFP', 'HH_MED_INC']].copy()
+    county_medians['CO_FIPS'] = county_medians['COUNTYFP'].astype(int)
+    county_medians = county_medians.rename(columns={'HH_MED_INC': 'County_MedInc'})
+
+    # Merge with TAZ data
+    df_taz_aggregated = df_taz_aggregated.merge(
+        county_medians[['CO_FIPS', 'County_MedInc']],
+        on='CO_FIPS',
+        how='left'
+    )
+
+    # Fill NULL values with county median
+    df_taz_aggregated['MedInc'] = df_taz_aggregated['MedInc'].fillna(
+        df_taz_aggregated['County_MedInc']
+    )
+
+    print(f"After county fallback - TAZs with NULL: {df_taz_aggregated['MedInc'].isna().sum()}")
+else:
+    print("No NULL values found - all TAZs have median income!")
+```
+
+## Results & Visualizations
+
+### TAZ Median Income Summary
+
+```{python}
+# Create final TAZ output
+df_taz_income = df_taz_aggregated[[
+    'CO_TAZID',
+    'SUBAREAID',
+    'CO_FIPS',
+    'CO_NAME',
+    'MedInc',
+    'HH23'
+]].copy()
+
+# Sort by CO_TAZID
+df_taz_income = df_taz_income.sort_values('CO_TAZID').reset_index(drop=True)
+
+print("="*80)
+print("FINAL TAZ MEDIAN INCOME RESULTS")
+print("="*80)
+df_taz_income
+```
+
+```{python}
+# Display TAZs with no households
+no_hh_tazs = df_taz_income[df_taz_income['HH23'] == 0]
+if len(no_hh_tazs) > 0:
+    print(f"\nTAZs with no households: {len(no_hh_tazs)}")
+    print(no_hh_tazs[['CO_TAZID', 'CO_NAME', 'MedInc', 'HH23']].head(10))
+```
+
+### Interactive Map: TAZ Median Income
+
+```{python}
+# Visualize the distribution of TAZ median incomes
+gdf_TAZ[['CO_TAZID', 'geometry']].merge(
+    df_taz_income[['CO_TAZID', 'SUBAREAID', 'CO_FIPS', 'CO_NAME', 'MedInc', 'HH23']],
+    on='CO_TAZID',
+    how='left'
+).explore(
+    column="MedInc",
+    cmap="YlGnBu",
+    legend=True,
+    tooltip=["CO_TAZID", "CO_NAME", "MedInc", "HH23"],
+    popup=True
+)
+```
+
+### Regional Median Income Summary
+
+```{python}
+# Calculate regional weighted medians
+df_regional_aggregated = df_taz_aggregated.groupby('SUBAREAID').agg({
+    'HH23': 'sum',
+    'HH_MedInc_Product': 'sum'
+}).reset_index()
+
+df_regional_aggregated['MedInc'] = np.where(
+    df_regional_aggregated['HH23'] > 0,
+    (df_regional_aggregated['HH_MedInc_Product'] / df_regional_aggregated['HH23']).round(0),
+    np.nan
+).astype(int)
+
+df_regional_aggregated['Model Space'] = df_regional_aggregated['SUBAREAID'].map(subareaid_lookup)
+
+df_regional_income = df_regional_aggregated[[
+    'SUBAREAID',
+    'Model Space',
+    'MedInc',
+    'HH23'
+]].copy().sort_values('SUBAREAID').reset_index(drop=True)
+
+print("\n" + "="*80)
+print("REGIONAL MEDIAN INCOME SUMMARY")
+print("="*80)
+df_regional_income
+```
+
+### Result Validation
+
+```{python}
+# Compare county median income with 2019 calculations
+df_regional_income_2019 = pd.read_excel(
+  r"_archive/_Source - TAZ & Regional Median Income - 2022-03-17.xlsb",
+  sheet_name="Export_MedInc",
+  usecols="H:J",
+  skiprows=4,
+  nrows=6,
+  engine="pyxlsb"
+)
+
+df_regional_income_2019 = df_regional_income_2019.rename(columns={
+    'MedInc': 'MedInc_2019'
+})
+```
+
+```{python}
+# Merge 2019 and 2023 data
+df_regional_comparison = df_regional_income.rename(columns={
+    'MedInc': 'MedInc_2023'
+}).merge(
+    df_regional_income_2019[['SUBAREAID', 'MedInc_2019']],
+    on='SUBAREAID',
+    how='left'
+)
+
+# Calculate absolute and percent change
+df_regional_comparison['Absolute_Change'] = (
+    df_regional_comparison['MedInc_2023'] - df_regional_comparison['MedInc_2019']
+)
+
+df_regional_comparison['Percent_Change'] = (
+    (df_regional_comparison['MedInc_2023'] - df_regional_comparison['MedInc_2019'])
+    / df_regional_comparison['MedInc_2019'] * 100
+).round(2)
+
+# Display comparison
+print("\n" + "="*80)
+print("REGIONAL MEDIAN INCOME COMPARISON: 2019 vs 2023")
+print("="*80)
+df_regional_comparison
+```
+
+### Chart
+
+#### County Median Income Distribution
+
+```{python}
+# Create plotting dataframe
 df_plot = gdf_county_income[['NAMELSAD', 'HH_MED_INC', 'HH_TOTAL']].copy()
 
-# Rank counties by median household income (highest = rank 1)
+# Rank counties by median household income
 df_plot["Rank"] = df_plot["HH_MED_INC"].rank(
-    method="min",       # assign smallest rank for ties
-    ascending=False     # highest income gets rank 1
+    method="min",
+    ascending=False
 ).astype(int)
 
 # Create Region column based on MPO counties
@@ -329,20 +1054,16 @@ mpo_counties = ['Summit County', 'Wasatch County', 'Davis County', 'Salt Lake Co
 
 df_plot['Region'] = df_plot['NAMELSAD'].apply(lambda x: 'MPO' if x in mpo_counties else 'Non-MPO')
 
-df_plot.sort_values(by="Rank")
-```
-
-```{python}
 # Define color mapping
 color_map = {'MPO': '#843C0C', 'Non-MPO': '#4472C4'}
 
-# Set the style
+# Set style
 sns.set_style("whitegrid")
 
 # Create figure
 plt.figure(figsize=(10, 6.5))
 
-# Create scatter plot with hue for automatic color separation
+# Create scatter plot
 sns.scatterplot(
     data=df_plot,
     x='Rank',
@@ -372,7 +1093,7 @@ sns.regplot(
 # Create list to store text objects
 texts = []
 
-# Add labels for each county with color based on Region
+# Add labels for each county
 for idx, row in df_plot.iterrows():
     county_name = row['NAMELSAD'].replace(' County', '').upper()
     income_label = f"${row['HH_MED_INC']:,.0f}"
@@ -396,20 +1117,16 @@ for idx, row in df_plot.iterrows():
 adjust_text(
     texts,
     arrowprops=dict(arrowstyle='->', color='gray', lw=0.5, alpha=0.6, shrinkA=10, shrinkB=10),
-    # expand_points=(100, 100),  # Increased from (1.5, 1.5)
-    # expand_text=(100, 100),    # Added to expand text bounding boxes
-    # force_text=(100, 100),     # Increased from (0.5, 0.5)
-    # force_points=(100, 100),   # Increased from (0.3, 0.3)
-    lim=500                    # Increased iteration limit for better placement
+    lim=500
 )
 
-# Add horizontal line at median income
+# Add horizontal line at state median
 state_avg = gdf_ut_income['HH_MED_INC'].values[0]
 plt.axhline(y=state_avg, color='#C00000', linestyle='--', linewidth=2, alpha=0.4)
 
-# Add text annotations for state average
-plt.text(29.5, state_avg + 1500, f'Utah State Median: ${state_avg:,.0f}', fontsize=10, color='#C00000',
-         ha='right', va='bottom', fontweight='bold')
+# Add text annotation for state average
+plt.text(29.5, state_avg + 1500, f'Utah State Median: ${state_avg:,.0f}',
+         fontsize=10, color='#C00000', ha='right', va='bottom', fontweight='bold')
 
 # Set axis limits and ticks
 plt.xlim(0, 30)
@@ -437,8 +1154,9 @@ plt.tight_layout()
 plt.show()
 ```
 
+#### County vs Block Group Median Comparison
+
 ```{python}
-# Create scatter plot: County Median Income vs Median of Block Group Median Incomes
 # Calculate median of block group median incomes for each county
 bg_median_by_county = gdf_bg_income[
     gdf_bg_income['HH_MED_INC'].notna()
@@ -528,7 +1246,7 @@ plt.title('County Median Income vs Median of Block Group Median Incomes',
 # Add legend
 plt.legend(loc='lower right', fontsize=9)
 
-# Add correlation coefficient and sample size
+# Add correlation coefficient
 corr = plot_data['BG_MedianOfMedians'].corr(plot_data['HH_MED_INC'])
 plt.text(0.02, 0.98, f'Correlation: {corr:.3f}\nn={len(plot_data)} counties',
          transform=plt.gca().transAxes,
@@ -540,390 +1258,58 @@ plt.tight_layout()
 plt.show()
 ```
 
-### BlockSplit_wCOTAZID
-
-## Lookup Tables
-
-### ACS Column ID to Label
+#### 2019 vs 2023 Regional Median Income Comparison
 
 ```{python}
-lookup_hhinc = pd.DataFrame({
-  "Income Category": [
-    "HH_LT_10K", "HH_10_15K", "HH_15_20K", "HH_20_25K", "HH_25_30K", "HH_30_35K",
-    "HH_35_40K", "HH_40_45K", "HH_45_50K", "HH_50_60K", "HH_60_75K",
-    "HH_75_100K", "HH_100_125K", "HH_125_150K", "HH_150_200K", "HH_GT_200K"
-  ],
-  "Lower Limit": [
-    0, 10000, 15000, 20000, 25000, 30000,
-    35000, 40000, 45000, 50000, 60000,
-    75000, 100000, 125000, 150000, 200000
-  ],
-  "Upper Limit": [
-    9999, 14999, 19999, 24999, 29999, 34999,
-    39999, 44999, 49999, 59999, 74999,
-    99999, 124999, 149999, 199999, np.inf
-  ]
-})
-
-# Compute midpoint and round it
-lookup_hhinc['Midpoint'] = (
-  (lookup_hhinc['Lower Limit'] + lookup_hhinc['Upper Limit']) / 2
-).round()
-
-# Replace infinite midpoint (last category) with 300000
-lookup_hhinc.loc[np.isinf(lookup_hhinc["Upper Limit"]), "Midpoint"] = 300000
-
-lookup_hhinc
-```
-
-### BlockGroupID for TAZ Centroid (Use if No HH in TAZ)
-
-```{python}
-lookup_hhinc["Income Category"].tolist()
-```
-
-## Intermediate Processing
-
-
-
-### Process_ACS_BG
-
-- Implement the cumulative sum median calculation
-- Handle cases where block groups have no median (use county data)
-- Create the processed Block Group dataframe with calculated medians
-
-```{python}
-# Get list of income bracket from lookup table
-income_bracket_cols = lookup_hhinc["Income Category"].tolist()
-
-# Get midpoint values from lookup table
-midpoints = lookup_hhinc['Midpoint'].values
-
-# Prepare working dataset
-df_bg_income_process = gdf_bg_income[[
-    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC', 'HH_MED_INC_MOE',
-    *income_bracket_cols
-]].copy()
-```
-
-```{python}
-# Define the function
-def estimate_median(row, income_columns, midpoints):
-    """
-    Find median income from household income distribution
-
-    row: DataFrame row with household counts by income bracket
-    income_columns: List of column names with HH counts (HH_LT_10K, HH_10_15K, etc.)
-    midpoints: Array of income bracket midpoints
-    """
-    total_hh = row['HH_TOTAL']
-
-    # Handle edge cases
-    if pd.isna(total_hh) or total_hh == 0:
-        return np.nan
-
-    cumsum = 0
-    for col, midpoint in zip(income_columns, midpoints):
-        # Handle missing values in income brackets
-        hh_count = row[col] if pd.notna(row[col]) else 0
-        cumsum += hh_count
-
-        if cumsum > total_hh / 2:
-            return midpoint
-
-    return 300000  # Default for highest bracket
-
-# Apply the function to each row to calculate estimated median
-df_bg_income_process['EstMedInc'] = df_bg_income_process.apply(
-    estimate_median,
-    axis=1,  # Apply function row-wise
-    income_columns=income_bracket_cols,
-    midpoints=midpoints
+# Prepare long format data
+df_long = df_regional_comparison.melt(
+    id_vars=['Model Space'],
+    value_vars=['MedInc_2019', 'MedInc_2023'],
+    var_name='Year',
+    value_name='Median Income'
 )
+df_long['Year'] = df_long['Year'].str.replace('MedInc_', '')
 ```
 
 ```{python}
-# Assign data quality flags
-conditions = [
-    # Condition 1: Does the block group have a good ACS reported median?
-    (df_bg_income_process['HH_MED_INC'].notna()) &           # Median exists (not missing)
-    (df_bg_income_process['HH_MED_INC'] > 0) &               # Median is positive
-    (df_bg_income_process['HH_MED_INC'] < 250000),           # Median is reasonable (not extreme)
-
-    # Condition 2: Do we have an estimated median from distribution?
-    df_bg_income_process['EstMedInc'].notna()                # Estimated median exists
-]
-
-df_bg_income_process['Flag'] = np.select(
-    conditions,      # List of conditions to check
-    [0, 2],         # Values to assign: 0 if condition 1 True, 2 if condition 2 True
-    default=1       # If neither condition is True, assign 1
-)
+# Plot 1: Grouped bar chart
+sns.set_style("whitegrid")
+plt.figure(figsize=(9, 6))
+ax = sns.barplot(data=df_long, x='Model Space', y='Median Income', hue='Year',
+                 palette={'2019': '#4472C4', '2023': '#843C0C'})
+plt.title('Regional Median Income\n2019 vs 2023', fontweight='bold', pad=15)
+plt.xticks(rotation=45, ha='right')
+plt.ylabel('Median Household Income ($)', fontweight='bold')
+plt.xlabel('Model Space', fontweight='bold')
+ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x/1000:.0f}K'))
+ax.bar_label(ax.containers[0], fmt='$%,.0f', fontsize=8)
+ax.bar_label(ax.containers[1], fmt='$%,.0f', fontsize=8)
+plt.tight_layout()
+plt.show()
 ```
 
 ```{python}
-# Join county median for fallback
-df_bg_income_process = df_bg_income_process.merge(
-    gdf_county_income[['COUNTYFP', 'HH_MED_INC']].rename(columns={'HH_MED_INC': 'County_MedInc'}),
-    on='COUNTYFP',
-    how='left'
-)
+# Plot 2: Percent change
+colors = ['green' if x >= 0 else 'red' for x in df_regional_comparison['Percent_Change']]
+sns.set_style("whitegrid")
+plt.figure(figsize=(9, 6))
+sns.barplot(data=df_regional_comparison, y='Model Space', x='Percent_Change',
+            hue='Model Space', palette=colors, legend=False)
+plt.title('Percent Change in Median Income\n(2019 to 2023)', fontweight='bold', pad=15)
+plt.xlabel('Percent Change (%)', fontweight='bold')
+plt.ylabel('')
+plt.axvline(x=0, color='black', linewidth=0.8)
+
+# Add percent labels
+for i, val in enumerate(df_regional_comparison['Percent_Change']):
+    plt.text(val, i, f' {val:.1f}%', ha='left' if val >= 0 else 'right',
+            va='center', fontweight='bold', fontsize=9)
+
+plt.tight_layout()
+plt.show()
 ```
 
-```{python}
-# Create final median income column based on flag
-medinc_conditions = [
-    df_bg_income_process['Flag'] == 0,
-    df_bg_income_process['Flag'] == 1,
-    df_bg_income_process['Flag'] == 2
-]
-
-medinc_choices = [
-    df_bg_income_process['HH_MED_INC'],
-    df_bg_income_process['County_MedInc'],
-    df_bg_income_process['EstMedInc']
-]
-
-df_bg_income_process['Median Income'] = np.select(medinc_conditions, medinc_choices, default=np.nan)
-```
-
-```{python}
-# Create final processed dataset
-df_bg_income_process = df_bg_income_process[[
-    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC',
-    'EstMedInc', 'County_MedInc', 'Flag', 'Median Income'
-]].copy()
-
-# Display summary
-df_bg_income_process.head(10)
-```
-
-```{python}
-#| eval: false
-
-# Explore the processed block group median income data
-gdf_bg_bound[['GEOID', 'geometry']].merge(
-    df_bg_income_process,
-    on='GEOID',
-    how='left'
-).explore(
-    column="Median Income",
-    cmap="YlGnBu",
-    legend=True,
-    tooltip=["GEOID", "NAMELSAD", "HH_TOTAL", "Median Income", "Flag"]
-)
-```
-
-### Process_BlockSplit
-
-- Load BlockSplit_wCOTAZID data (you have this file)
-- Extract Block Group IDs
-- Join with processed ACS data
-- Calculate HH-weighted income products
-
-```{python}
-# Define variables to download
-dec_variables = {
-    'H9_001N': 'HH20'           # Total Number of Households
-}
-
-# Get census block geometries
-gdf_block_bound = blocks(
-    state=STATE_FIPS,
-    year=2020,
-    cache=True
-)
-
-# Download decennial census data at block level
-df_block_hh = get_census(
-    dataset="dec/dhc",
-    year=2020,
-    variables=list(dec_variables.keys()),
-    params={
-        # "key": f"{os.getenv('CENSUS_API_KEY')}",
-        "for": f"block:*",
-        "in": f"state:{STATE_FIPS} county:*"
-    },
-    return_geoid=True,
-    guess_dtypes=True,
-)
-
-# Join data to geometry and transform CRS
-gdf_block_hh = gdf_block_bound[['GEOID20', 'geometry']].merge(df_block_hh, left_on = "GEOID20", right_on = "GEOID").to_crs(PROJECT_CRS)
-
-# Rename columns
-gdf_block_hh = gdf_block_hh.rename(columns=dec_variables)[
-    ['GEOID', 'HH20', 'geometry']
-]
-
-# Preview data
-gdf_block_hh.head(10)
-```
-
-```{python}
-# Extract Block Group GEOID from Block GEOID (first 12 characters)
-gdf_block_hh['GEOID_BG'] = gdf_block_hh['GEOID'].str[:12]
-
-# Add Block Group GEOID to processed block group data
-df_bg_income_process['GEOID_BG'] = df_bg_income_process['GEOID']
-
-# Join block group median income and total HH to blocks
-gdf_block_income = gdf_block_hh.merge(
-    df_bg_income_process[['GEOID_BG', 'HH_TOTAL', 'Median Income']],
-    on='GEOID_BG',
-    how='left'
-)
-```
-
-```{python}
-# Calculate total 2020 HH per block group
-bg_totals_2020 = gdf_block_income.groupby('GEOID_BG')['HH20'].sum().reset_index()
-bg_totals_2020.columns = ['GEOID_BG', 'HH20_BG_Total']
-
-# Join block group totals back to blocks
-gdf_block_income = gdf_block_income.merge(bg_totals_2020, on='GEOID_BG', how='left')
-```
-
-```{python}
-# Calculate 2020 proportion for each block
-gdf_block_income['Proportion'] = np.where(
-    gdf_block_income['HH20_BG_Total'] > 0,
-    gdf_block_income['HH20'] / gdf_block_income['HH20_BG_Total'],
-    0
-)
-
-# Distribute 2023 HH from block group to blocks
-gdf_block_income['HH23'] = (
-    gdf_block_income['HH_TOTAL'] * gdf_block_income['Proportion']
-).round(0).astype('Int64')
-```
-
-```{python}
-# Create final dataset
-gdf_block_final = gdf_block_income[[
-    'GEOID',
-    'GEOID_BG',
-    'HH20',
-    'HH23',
-    'Median Income',
-    'geometry'
-]].copy()
-
-gdf_block_final.head(10)
-```
-
-### Calc_TAZ_MedInc
-
-- Group by TAZ and calculate weighted averages
-- Apply CPI adjustment factors
-- Generate both TAZ-level and County-level summaries
-
-```{python}
-# Convert blocks to centroids
-gdf_block_centroids = gdf_block_final.copy()
-gdf_block_centroids['geometry'] = gdf_block_centroids.geometry.centroid
-```
-
-```{python}
-#| eval: false
-
-# Run this if CO_FIPS and CO_NAME doesn't exist in TAZ file
-
-# Spatial join TAZ with county boundaries to get county information
-gdf_TAZ = gpd.sjoin(
-    gdf_TAZ,
-    gdf_county_bound[['COUNTYFP', 'NAMELSAD', 'geometry']],
-    how='left',
-    predicate='intersects'
-)
-
-# Rename and keep only necessary columns
-gdf_TAZ['CO_FIPS'] = gdf_TAZ['COUNTYFP']
-gdf_TAZ['CO_NAME'] = gdf_TAZ['NAMELSAD'].str.replace(' County', '').str.upper()
-
-# Drop the extra columns from the join
-gdf_TAZ = gdf_TAZ.drop(columns=['index_right', 'COUNTYFP', 'NAMELSAD'])
-```
-
-```{python}
-# Refine the format for ID columns
-gdf_TAZ["CO_TAZID"] = gdf_TAZ["CO_TAZID"].astype(int)
-gdf_TAZ["SUBAREAID"] = gdf_TAZ["SUBAREAID"].astype(int)
-gdf_TAZ["CO_FIPS"] = gdf_TAZ["CO_FIPS"].astype(int)
-```
-
-```{python}
-# Spatial join: assign TAZ attributes to block centroids
-gdf_block_with_taz = gpd.sjoin(
-    gdf_block_centroids,
-    gdf_TAZ[['CO_TAZID', 'SUBAREAID', 'CO_FIPS', 'CO_NAME', 'geometry']],
-    how='left',
-    predicate='within'
-)
-```
-
-```{python}
-# Calculate weighted income (HH * Median Income) for each block
-gdf_block_with_taz['HH_MedInc_Product'] = (
-    gdf_block_with_taz['HH23'] * gdf_block_with_taz['Median Income']
-)
-```
-
-```{python}
-# Group by TAZ and calculate weighted mean
-taz_aggregated = gdf_block_with_taz.groupby('CO_TAZID').agg({
-    'SUBAREAID': 'first',
-    'CO_FIPS': 'first',
-    'CO_NAME': 'first',
-    'HH23': 'sum',
-    'HH_MedInc_Product': 'sum',
-    'Median Income': 'median'  # For fallback if HH23 = 0
-}).reset_index()
-
-# Calculate TAZ median income using weighted mean
-# If HH > 0, use weighted mean; otherwise use median
-taz_aggregated['MedInc'] = np.where(
-    taz_aggregated['HH23'].notna() & (taz_aggregated['HH23'] > 0),
-    (taz_aggregated['HH_MedInc_Product'] / taz_aggregated['HH23']).round(0),
-    taz_aggregated['Median Income'].round(0)
-)
-
-taz_aggregated.head(10)
-```
-
-```{python}
-# Visualize the distribution of TAZ median incomes
-gdf_TAZ[['CO_TAZID', 'geometry']].merge(
-    taz_aggregated[['CO_TAZID', 'SUBAREAID', 'CO_FIPS', 'CO_NAME', 'MedInc', 'HH23']],
-    on='CO_TAZID',
-    how='left'
-).explore(
-    column="MedInc",
-    cmap="YlGnBu",
-    legend=True,
-    tooltip=["CO_TAZID", "MedInc", "HH23"]
-)
-```
-
-## Export_MedInc
-
-- Format final TAZ output
-- Format regional summary
-
-### TAZ Median Income (SE Files)
-
-```{python}
-# Create final output
-gdf_taz_income = taz_aggregated[[
-    'CO_TAZID',
-    'SUBAREAID',
-    'CO_FIPS',
-    'CO_NAME',
-    'MedInc'
-]].copy()
-
-gdf_taz_income.head(10)
-```
+## Export Results
 
 ```{python}
 # Create output directory if it doesn't exist
@@ -931,59 +1317,13 @@ output_dir = Path("_output")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Export to CSV
-gdf_taz_income.to_csv(
+df_taz_income.to_csv(
     output_dir / "taz_median_income.csv",
     index=False
 )
-```
 
-### Regional Median Income (General Parameters)
-
-```{python}
-# Create SUBAREAID to Model Space lookup dictionary
-subareaid_lookup = {
-    0: 'UDOT',
-    1: 'Wasatch Front',
-    2: 'Cache',
-    3: 'Dixie',
-    4: 'Summit-Wasatch',
-    5: 'Iron'
-}
-```
-
-```{python}
-# Group by SUBAREAID and calculate weighted mean
-regional_aggregated = taz_aggregated.groupby('SUBAREAID').agg({
-    'HH23': 'sum',
-    'HH_MedInc_Product': 'sum',
-    'Median Income': 'mean'
-}).reset_index()
-
-# Calculate regional median income using weighted mean
-regional_aggregated['MedInc'] = np.where(
-    regional_aggregated['HH23'] > 0,
-    (regional_aggregated['HH_MedInc_Product'] / regional_aggregated['HH23']).round(0),
-    regional_aggregated['Median Income'].round(0)
-).astype(int)
-```
-
-```{python}
-# Map SUBAREAID to Model Space names
-regional_aggregated['Model Space'] = regional_aggregated['SUBAREAID'].map(subareaid_lookup)
-
-# Create final output
-gdf_regional_income = regional_aggregated[[
-    'SUBAREAID',
-    'Model Space',
-    'MedInc'
-]].copy()
-
-gdf_regional_income.head(10)
-```
-
-```{python}
 # Export to CSV
-gdf_regional_income.to_csv(
+df_regional_income.to_csv(
     output_dir / "regional_median_income.csv",
     index=False
 )
