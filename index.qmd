@@ -20,6 +20,11 @@ format:
         light: flatly
         dark: darkly
     respect-user-color-scheme: true
+
+    fig-width: 8.4
+    fig-height: 6
+    fig-responsive: true
+
     toc: true
     number-sections: true
     number-depth: 2
@@ -1187,12 +1192,16 @@ df_plot['Region'] = df_plot['NAMELSAD'].apply(lambda x: 'MPO' if x in mpo_counti
 
 # Define color mapping
 color_map = {'MPO': '#843C0C', 'Non-MPO': '#4472C4'}
+```
+
+```{python}
+#| out-width: "100%"
 
 # Set style
 sns.set_style("whitegrid")
 
 # Create figure
-plt.figure(figsize=(10, 6.5))
+# plt.figure(figsize=(10, 8))
 
 # Create scatter plot
 sns.scatterplot(
@@ -1292,6 +1301,8 @@ The chart distinguishes between MPO (Metropolitan Planning Organization) and non
 This validation chart compares county-level median income (reported directly by ACS) with the median of all block group medians within each county. If our block group data is reliable, these two values should be highly correlated.
 
 ```{python}
+#| out-width: "100%"
+
 # Calculate median of block group median incomes for each county
 bg_median_by_county = gdf_bg_income[
     gdf_bg_income['HH_MED_INC'].notna()
@@ -1315,7 +1326,7 @@ plot_data = plot_data[
 sns.set_style("whitegrid")
 
 # Create figure
-plt.figure(figsize=(10, 8))
+# plt.figure(figsize=(10, 8))
 
 # Create scatter plot
 sns.scatterplot(
@@ -1442,9 +1453,11 @@ df_bg_comparison = pd.DataFrame({
 ```
 
 ```{python}
+#| out-width: "100%"
+
 # Plot: Overlaid histograms with 20 bins
 sns.set_style("whitegrid")
-plt.figure(figsize=(10, 6))
+# plt.figure(figsize=(10, 8))
 
 sns.histplot(
     data=df_bg_comparison,
@@ -1485,9 +1498,11 @@ df_long['Year'] = df_long['Year'].str.replace('MedInc_', '')
 ```
 
 ```{python}
+#| out-width: "100%"
+
 # Plot 1: Grouped bar chart
 sns.set_style("whitegrid")
-plt.figure(figsize=(9, 6))
+# plt.figure(figsize=(10, 8))
 ax = sns.barplot(data=df_long, x='Model Space', y='Median Income', hue='Year',
                  palette={'2019': '#4472C4', '2023': '#843C0C'})
 plt.title('Regional Median Income\n2019 vs 2023', fontweight='bold', pad=15)
@@ -1502,10 +1517,12 @@ plt.show()
 ```
 
 ```{python}
+#| out-width: "100%"
+
 # Plot 2: Percent change
 colors = ['green' if x >= 0 else 'red' for x in df_regional_comparison['Percent_Change']]
 sns.set_style("whitegrid")
-plt.figure(figsize=(9, 6))
+# plt.figure(figsize=(10, 8))
 sns.barplot(data=df_regional_comparison, y='Model Space', x='Percent_Change',
             hue='Model Space', palette=colors, legend=False)
 plt.title('Percent Change in Median Income\n(2019 to 2023)', fontweight='bold', pad=15)
