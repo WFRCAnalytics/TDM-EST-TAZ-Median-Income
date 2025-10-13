@@ -1002,14 +1002,12 @@ df_regional_income_2019 = pd.read_excel(
   engine="pyxlsb"
 )
 
-df_regional_income_2019 = df_regional_income_2019.rename(columns={
-    'MedInc': 'MedInc_2019'
-})
+df_regional_income_2019[['MedInc_2019']] = df_regional_income_2019[['MedInc']].astype(int)
 ```
 
 ```{python}
 # Merge 2019 and 2023 data
-df_regional_comparison = df_regional_income.rename(columns={
+df_regional_comparison = df_regional_income[['SUBAREAID', 'Model Space', 'MedInc']].rename(columns={
     'MedInc': 'MedInc_2023'
 }).merge(
     df_regional_income_2019[['SUBAREAID', 'MedInc_2019']],
@@ -1026,6 +1024,8 @@ df_regional_comparison['Percent_Change'] = (
     (df_regional_comparison['MedInc_2023'] - df_regional_comparison['MedInc_2019'])
     / df_regional_comparison['MedInc_2019'] * 100
 ).round(2)
+
+
 
 # Display comparison
 print("\n" + "="*80)
@@ -1258,6 +1258,82 @@ plt.tight_layout()
 plt.show()
 ```
 
+#### 2019 vs 2023 Block Group Income Distribution
+
+```{python}
+# Fetch block group boundaries from TIGER/Line shapefiles
+gdf_bg_bound19 = block_groups(
+  state=STATE_FIPS,
+  year=2019,
+  cache=True
+).to_crs(PROJECT_CRS)
+
+# Fetch Income data from ACS 5-year estimates for block groups in Utah
+df_bg_income19 = get_census(
+  dataset="acs/acs5",
+  year=2019,
+  variables=list(acs_variables.keys()),
+  params={
+      # "key": f"{os.getenv('CENSUS_API_KEY')}", # FIXME: This causes error
+      "for": f"block group:*",
+      "in": f"state:{STATE_FIPS} county:*"
+    },
+    return_geoid=True,
+    guess_dtypes=True
+)
+
+# Join ACS data to block group boundaries and transform CRS
+gdf_bg_income19 = gdf_bg_bound19[['GEOID', 'COUNTYFP', 'NAMELSAD', 'geometry']].merge(
+    df_bg_income19, on = "GEOID"
+).to_crs(PROJECT_CRS).rename(columns=acs_variables)
+
+# preview data
+print(f"Total block groups: {len(gdf_bg_income19)}")
+gdf_bg_income19.head(10)
+```
+
+```{python}
+# Prepare data: Combine 2019 and 2023 block group income data
+df_bg_comparison = pd.DataFrame({
+    'Median Income': pd.concat([
+        gdf_bg_income19['HH_MED_INC'].dropna(),
+        gdf_bg_income['HH_MED_INC'].dropna()
+    ]),
+    'Year': ['2019'] * gdf_bg_income19['HH_MED_INC'].notna().sum() +
+            ['2023'] * gdf_bg_income['HH_MED_INC'].notna().sum()
+})
+
+print(f"2019 Block Groups: {(df_bg_comparison['Year'] == '2019').sum()}")
+print(f"2023 Block Groups: {(df_bg_comparison['Year'] == '2023').sum()}")
+df_bg_comparison.head()
+```
+
+```{python}
+# Plot: Overlaid histograms with 20 bins
+sns.set_style("whitegrid")
+plt.figure(figsize=(10, 6))
+
+sns.histplot(
+    data=df_bg_comparison,
+    x='Median Income',
+    hue='Year',
+    bins=20,
+    palette={'2019': '#843C0C', '2023': '#4472C4'},
+    alpha=0.6,
+    stat='count',
+    element='bars',
+    kde=False
+)
+
+plt.title('Block Group Median Income Distribution\n2019 vs 2023',
+          fontweight='bold', fontsize=14, pad=15)
+plt.xlabel('Median Household Income ($)', fontweight='bold', fontsize=11)
+plt.ylabel('Number of Block Groups', fontweight='bold', fontsize=11)
+plt.gca().xaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x/1000:.0f}K'))
+plt.tight_layout()
+plt.show()
+```
+
 #### 2019 vs 2023 Regional Median Income Comparison
 
 ```{python}
@@ -1282,8 +1358,8 @@ plt.xticks(rotation=45, ha='right')
 plt.ylabel('Median Household Income ($)', fontweight='bold')
 plt.xlabel('Model Space', fontweight='bold')
 ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'${x/1000:.0f}K'))
-ax.bar_label(ax.containers[0], fmt='$%,.0f', fontsize=8)
-ax.bar_label(ax.containers[1], fmt='$%,.0f', fontsize=8)
+ax.bar_label(ax.containers[0], labels=[f'${x:,.0f}' for x in ax.containers[0].datavalues], fontsize=8)
+ax.bar_label(ax.containers[1], labels=[f'${x:,.0f}' for x in ax.containers[1].datavalues], fontsize=8)
 plt.tight_layout()
 plt.show()
 ```
