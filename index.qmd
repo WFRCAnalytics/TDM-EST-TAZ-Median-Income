@@ -22,7 +22,7 @@ format:
     respect-user-color-scheme: true
 
     fig-width: 8.4
-    fig-height: 6
+    fig-height: 5.44
     fig-responsive: true
 
     toc: true
