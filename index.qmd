@@ -1504,7 +1504,7 @@ df_long['Year'] = df_long['Year'].str.replace('MedInc_', '')
 sns.set_style("whitegrid")
 # plt.figure(figsize=(10, 8))
 ax = sns.barplot(data=df_long, x='Model Space', y='Median Income', hue='Year',
-                 palette={'2019': '#4472C4', '2023': '#843C0C'})
+                 palette={'2019': '#843C0C', '2023': '#4472C4'})
 plt.title('Regional Median Income\n2019 vs 2023', fontweight='bold', pad=15)
 plt.xticks(rotation=45, ha='right')
 plt.ylabel('Median Household Income ($)', fontweight='bold')
