@@ -119,6 +119,40 @@ os.environ['CENSUS_API_KEY'] = 'your_api_key_here'
 
 ## Define Helper Functions
 
+To maintain code reusability and follow DRY (Don't Repeat Yourself) principles, we define helper functions for common operations throughout the analysis.
+
+### Fetch Excel Files from BLS or BTS
+
+This utility function automates downloading data files from federal agencies. It checks if a file already exists locally before attempting to download, avoiding unnecessary network requests and respecting the agencies' servers. The function includes proper HTTP headers to ensure reliable downloads.
+
+```{python}
+def fetch_excel(path, url):
+    """
+    Download Excel file if it doesn't exist locally.
+
+    Parameters:
+    -----------
+    path : str or Path
+        Local file path to save the Excel file
+    url : str
+        URL to download the Excel file from
+    """
+    # Convert to Path object if string
+    filepath = Path(path)
+
+    # Download file if it doesn't exist
+    if not filepath.exists():
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+
+        response = requests.get(url, headers=headers)
+        filepath.write_bytes(response.content)
+```
+
+
 ### Weighted Spatial Interpolation Function
 
 This custom function performs population-weighted areal interpolation, which is a sophisticated method for transferring data between different geographic units. Traditional spatial joins often use centroids or simple overlaps, which can introduce errors when dealing with irregularly shaped polygons or when population is not evenly distributed.
@@ -402,23 +436,22 @@ Download and load the CPI data directly from the BLS website. The data includes 
 Data Source: Consumer Price Index for All Urban Consumers (CPI-U) \[Source: [Bureau of Labor Statistics](https://www.bls.gov/cpi/research-series/r-cpi-u-rs-home.htm)\]
 
 ```{python}
-# Ensure file exists
+# Set file path and URL for CPI data
 filepath_cpi = Path("_data/bls/r-cpi-u-rs-allitems.xlsx")
-if not filepath_cpi.exists():
-    filepath_cpi.parent.mkdir(parents=True, exist_ok=True)
-    response = requests.get("https://www.bls.gov/cpi/research-series/r-cpi-u-rs-allitems.xlsx")
-    filepath_cpi.write_bytes(response.content)
+url_cpi = "https://www.bls.gov/cpi/research-series/r-cpi-u-rs-allitems.xlsx"
 
-# Read Excel file directly from URL
+# Ensure the file exists, Download if not
+fetch_excel(path=filepath_cpi, url=url_cpi)
+
+# Read Excel file
 df_CPI = pd.read_excel(
-  filepath_cpi, # File path
-  sheet_name="All items",
-  usecols="A:N", # TODO: update cols later for new data
-  skiprows=5,    # Skip the first two rows
-  engine='openpyxl'  # Specify engine
+    filepath_cpi,
+    sheet_name="All items",
+    usecols="A:N",
+    skiprows=5,
+    engine='openpyxl'
 )
 
-# display the data
 df_CPI
 ```
 
