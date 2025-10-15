@@ -1242,7 +1242,7 @@ sns.scatterplot(
     x='Rank',
     y='HH_MED_INC',
     size='HH_TOTAL',
-    sizes=(100, 10000),
+    sizes=(50, 7500),
     hue='Region',
     palette=color_map,
     alpha=0.3,
@@ -1289,7 +1289,7 @@ for idx, row in df_plot.iterrows():
 # Adjust text positions to avoid overlap
 adjust_text(
     texts,
-    arrowprops=dict(arrowstyle='->', color='gray', lw=0.5, alpha=0.6, shrinkA=10, shrinkB=10),
+    arrowprops=dict(arrowstyle='-', color='gray', lw=0.5, alpha=0.6, shrinkA=10, shrinkB=10),
     lim=500
 )
 
