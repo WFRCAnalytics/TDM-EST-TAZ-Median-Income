@@ -1,3 +1,6 @@
 .env
 _data/TAZ/WFv920_TAZ.*
 _data/TAZ/*.geojson
+
+/.quarto/
+**/*.quarto_ipynb
