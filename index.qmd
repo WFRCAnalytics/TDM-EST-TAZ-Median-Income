@@ -24,7 +24,7 @@ The process involves several key steps: obtaining income data at the block group
 Install the necessary Python packages for data processing, spatial analysis, and visualization. This includes pandas for data manipulation, geopandas for spatial operations, pygris for accessing Census TIGER/Line shapefiles, and various visualization libraries.
 
 ``` python
-!conda install -c conda-forge numpy pandas geopandas matplotlib seaborn python-dotenv openpyxl
+!conda install -c conda-forge numpy pandas geopandas matplotlib seaborn python-dotenv openpyxl libpysal
 !pip install pygris adjustText
 ```
 
@@ -50,6 +50,8 @@ from adjustText import adjust_text
 from pygris import blocks, block_groups, counties, states
 from pygris.helpers import validate_state, validate_county
 from pygris.data import get_census
+
+from libpysal.weights import Queen
 
 # misc
 import datetime
@@ -317,53 +319,6 @@ def interpolate_pw(from_gdf, to_gdf, weights_gdf, to_id=None, extensive=True,
             result[col] = result[col].fillna(0)
 
     return result
-```
-
-### Median Income Estimation Function
-
-When detailed income distribution data is unavailable at the Census block level, we need to estimate median income from the income bracket counts available in the ACS. This function implements the cumulative distribution method, which:
-
-1. Calculates the cumulative sum of households across income brackets
-2. Identifies the bracket containing the 50th percentile (median)
-3. Returns the midpoint of that bracket as the estimated median
-
-This provides a reasonable approximation when direct median values are suppressed or unavailable due to data quality concerns.
-
-```{python}
-def estimate_median(row, income_columns, midpoints):
-    """
-    Find median income from household income distribution using cumulative sum method.
-
-    Parameters:
-    -----------
-    row : DataFrame row
-        Row with household counts by income bracket
-    income_columns : list
-        List of column names with HH counts (HH_LT_10K, HH_10_15K, etc.)
-    midpoints : array
-        Array of income bracket midpoints
-
-    Returns:
-    --------
-    float
-        Estimated median income
-    """
-    total_hh = row['HH_TOTAL']
-
-    # Handle edge cases
-    if pd.isna(total_hh) or total_hh == 0:
-        return np.nan
-
-    cumsum = 0
-    for col, midpoint in zip(income_columns, midpoints):
-        # Handle missing values in income brackets
-        hh_count = row[col] if pd.notna(row[col]) else 0
-        cumsum += hh_count
-
-        if cumsum > total_hh / 2:
-            return midpoint
-
-    return 300000  # Default for highest bracket
 ```
 
 ## Raw Data Sources
@@ -695,33 +650,6 @@ subareaid_lookup
 
 The ACS provides median income directly for most block groups, but some have missing or suppressed values due to small sample sizes or data quality concerns. We need a systematic approach to handle these cases while maintaining data reliability.
 
-Apply the median estimation function to calculate income from the household distribution for each block group. This provides a fallback when the ACS-reported median is unavailable.
-
-```{python}
-# Get list of income bracket from lookup table
-income_bracket_cols = lookup_hhinc["Income Category"].tolist()
-
-# Get midpoint values from lookup table
-midpoints = lookup_hhinc['Midpoint'].values
-
-# Prepare working dataset
-df_bg_income_process = gdf_bg_income[[
-    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC', 'HH_MED_INC_MOE',
-    *income_bracket_cols
-]].copy()
-
-# Apply the function to each row to calculate estimated median
-df_bg_income_process['EstMedInc'] = df_bg_income_process.apply(
-    estimate_median,
-    axis=1,  # Apply function row-wise
-    income_columns=income_bracket_cols,
-    midpoints=midpoints
-)
-
-print("Estimated median income calculated")
-df_bg_income_process.head()
-```
-
 Assign quality flags to each block group based on data availability:
 
 * **Flag 0:** High quality - ACS reported median is available and reasonable (>$0 and <$250,000)
@@ -731,57 +659,33 @@ Assign quality flags to each block group based on data availability:
 Create the final median income column by selecting the most appropriate value based on the quality flag. This hierarchical approach prioritizes direct ACS estimates but ensures all block groups have a reasonable income value.
 
 ```{python}
-# Assign data quality flags
-conditions = [
-    # Condition 1: Does the block group have a good ACS reported median?
-    (df_bg_income_process['HH_MED_INC'].notna()) &           # Median exists (not missing)
-    (df_bg_income_process['HH_MED_INC'] > 0) &               # Median is positive
-    (df_bg_income_process['HH_MED_INC'] < 250001),           # Median is reasonable (not extreme)
-
-    # Condition 2: Do we have an estimated median from distribution?
-    df_bg_income_process['EstMedInc'].notna()                # Estimated median exists
-]
-
-df_bg_income_process['Flag'] = np.select(
-    conditions,      # List of conditions to check
-    [0, 2],         # Values to assign: 0 if condition 1 True, 2 if condition 2 True
-    default=1       # If neither condition is True, assign 1
-)
-
-# Join county median for fallback
-df_bg_income_process = df_bg_income_process.merge(
-    gdf_county_income[['COUNTYFP', 'HH_MED_INC']].rename(columns={'HH_MED_INC': 'County_MedInc'}),
-    on='COUNTYFP',
-    how='left'
-)
-
-# Create final median income column based on flag
-medinc_conditions = [
-    df_bg_income_process['Flag'] == 0,
-    df_bg_income_process['Flag'] == 1,
-    df_bg_income_process['Flag'] == 2
-]
-
-medinc_choices = [
-    df_bg_income_process['HH_MED_INC'], # ACS Reported block group household Income
-    df_bg_income_process['County_MedInc'], # County fallback if none is true
-    df_bg_income_process['EstMedInc'] # Estimated median fallback if ACS reported doesnt exist
-]
-
-df_bg_income_process['Median Income'] = np.select(medinc_conditions, medinc_choices, default=np.nan)
-```
-
-```{python}
-# Create final processed dataset
-df_bg_income_process = df_bg_income_process[[
-    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC',
-    'EstMedInc', 'County_MedInc', 'Flag', 'Median Income'
+# Prepare working dataset - Only keep direct ACS reported median
+df_bg_income_process = gdf_bg_income[[
+    'GEOID', 'COUNTYFP', 'NAMELSAD', 'HH_TOTAL', 'HH_MED_INC'
 ]].copy()
 
-# Add GEOID_BG column
+# Define validity conditions for ACS reported median
+# Valid if: Not NaN, > 0, and not an extreme outlier (>= $250k)
+valid_condition = (
+    (df_bg_income_process['HH_MED_INC'].notna()) &
+    (df_bg_income_process['HH_MED_INC'] > 0) &
+    (df_bg_income_process['HH_MED_INC'] < 250001)
+)
+
+# Set strictly to NaN if invalid
+df_bg_income_process['Median Income'] = np.where(
+    valid_condition,
+    df_bg_income_process['HH_MED_INC'],
+    np.nan
+)
+
+# Add GEOID_BG column for joining later
 df_bg_income_process['GEOID_BG'] = df_bg_income_process['GEOID']
 
-# Display summary
+print(f"Total Block Groups: {len(df_bg_income_process)}")
+print(f"Valid ACS Medians: {df_bg_income_process['Median Income'].notna().sum()}")
+print(f"Missing/Invalid Medians (to be spatially filled): {df_bg_income_process['Median Income'].isna().sum()}")
+
 df_bg_income_process.head(10)
 ```
 
@@ -792,7 +696,7 @@ Combine the block group geometries with the processed income data. This creates 
 ```{python}
 # Get block group geometries with median income
 gdf_bg_with_income = gdf_bg_bound[['GEOID', 'geometry']].merge(
-    df_bg_income_process[['GEOID_BG', "NAMELSAD", "HH_TOTAL", "Median Income", "Flag"]],
+    df_bg_income_process[['GEOID_BG', "NAMELSAD", "HH_TOTAL", "Median Income"]],
     left_on='GEOID',
     right_on='GEOID_BG',
     how='inner'
@@ -830,15 +734,59 @@ Median income is transferred directly from block groups to blocks via a simple j
 :::
 
 ```{python}
-# Join median income from block groups to blocks
+# Join strict Median Income (with NaNs) from Block Groups to Blocks
 gdf_block_hh_income = gdf_block_hh.merge(
     df_bg_income_process[['GEOID_BG', 'Median Income']],
     on='GEOID_BG',
     how='left'
 )
 
-print(f"Blocks after join: {len(gdf_block_hh_income)}")
-print(f"Blocks with median income: {gdf_block_hh_income['Median Income'].notna().sum()}")
+# --- SPATIAL SMOOTHING START ---
+print("Starting Spatial Smoothing for missing block incomes...")
+print(f"Initial missing blocks: {gdf_block_hh_income['Median Income'].isna().sum()}")
+```
+
+```{python}
+# Create spatial weights matrix (Queen contiguity)
+# We use the dataframe index to identify neighbors
+w = Queen.from_dataframe(gdf_block_hh_income, use_index=True)
+
+# Iterative filling loop
+max_iterations = 5
+for i in range(max_iterations):
+    # Identify rows that are still missing income
+    missing_indices = gdf_block_hh_income[gdf_block_hh_income['Median Income'].isna()].index
+
+    # Dictionary to store updates for this iteration
+    updates = {}
+
+    for idx in missing_indices:
+        # Get neighbors for this block
+        if idx in w.neighbors:
+            neighbor_indices = w.neighbors[idx]
+
+            # Extract income values of these neighbors
+            neighbor_incomes = gdf_block_hh_income.loc[neighbor_indices, 'Median Income']
+
+            # Calculate mean of VALID neighbors only (ignoring NaNs)
+            valid_neighbors = neighbor_incomes.dropna()
+
+            if not valid_neighbors.empty:
+                updates[idx] = valid_neighbors.mean()
+
+    # Apply updates from this iteration
+    if updates:
+        # We use fillna with a series mapped by index to update specific rows
+        update_series = pd.Series(updates)
+        gdf_block_hh_income['Median Income'] = gdf_block_hh_income['Median Income'].fillna(update_series)
+        print(f"Iteration {i+1}: Filled {len(updates)} blocks. Remaining missing: {gdf_block_hh_income['Median Income'].isna().sum()}")
+    else:
+        print(f"Iteration {i+1}: No new blocks could be filled. Stopping early.")
+        break
+
+print("Spatial Smoothing Complete.")
+# --- SPATIAL SMOOTHING END ---
+
 gdf_block_hh_income.head()
 ```
 
