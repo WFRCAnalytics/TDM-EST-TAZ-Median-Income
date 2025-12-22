@@ -51,7 +51,7 @@ from pygris import blocks, block_groups, counties, states
 from pygris.helpers import validate_state, validate_county
 from pygris.data import get_census
 
-from libpysal.weights import Queen
+from libpysal.weights import Rook
 
 # misc
 import datetime
@@ -747,9 +747,12 @@ print(f"Initial missing blocks: {gdf_block_hh_income['Median Income'].isna().sum
 ```
 
 ```{python}
-# Create spatial weights matrix (Queen contiguity)
-# We use the dataframe index to identify neighbors
-w = Queen.from_dataframe(gdf_block_hh_income, use_index=True)
+# --- SPATIAL SMOOTHING START ---
+print("Starting Spatial Smoothing for missing block incomes...")
+print(f"Initial missing blocks: {gdf_block_hh_income['Median Income'].isna().sum()}")
+
+# Use Rook contiguity instead of Queen
+w = Rook.from_dataframe(gdf_block_hh_income, use_index=True)
 
 # Iterative filling loop
 max_iterations = 5
@@ -770,16 +773,15 @@ for i in range(max_iterations):
 
             # Calculate mean of VALID neighbors only (ignoring NaNs)
             valid_neighbors = neighbor_incomes.dropna()
-
             if not valid_neighbors.empty:
-                updates[idx] = valid_neighbors.mean()
+                updates[idx] = valid_neighbors.mean().round(0)
 
     # Apply updates from this iteration
     if updates:
         # We use fillna with a series mapped by index to update specific rows
         update_series = pd.Series(updates)
         gdf_block_hh_income['Median Income'] = gdf_block_hh_income['Median Income'].fillna(update_series)
-        print(f"Iteration {i+1}: Filled {len(updates)} blocks. Remaining missing: {gdf_block_hh_income['Median Income'].isna().sum()}")
+        print(f"Iteration {i+1}: Filled {len(updates)} blocks. Remaining missing: {gdf_block_hh_income['Median Income'].isna().sum()}") #
     else:
         print(f"Iteration {i+1}: No new blocks could be filled. Stopping early.")
         break
