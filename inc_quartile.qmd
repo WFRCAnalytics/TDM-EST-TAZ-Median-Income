@@ -1,0 +1,543 @@
+---
+title: Wasatch Front Income Distribution Analysis
+subtitle: Household Income Quartile Calculation & Visualization
+author:
+ - name: Pukar Bhandari
+   email: pukar.bhandari@wfrc.utah.gov
+   affiliation:
+     - name: Wasatch Front Regional Council
+       url: "https://wfrc.utah.gov/"
+date: "2025-10-08"
+---
+
+## Introduction
+
+This analysis calculates the distribution of household income across the Wasatch Front region. By aggregating Census block group data within the regional Transportation Analysis Zone (TAZ) boundaries, we identify income quartiles and visualize the distribution of households across 16 income categories.
+
+The methodology approximates income quartiles (Inc Groups 1-4) by analyzing the cumulative percentage of households across ascending income brackets.
+
+## Environment Setup
+
+### Load Libraries
+
+```{python}
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import seaborn as sns
+from pygris import block_groups
+from pygris.data import get_census
+from pathlib import Path
+
+# Set visualization style
+sns.set_style("whitegrid")
+```
+
+## Configuration
+
+```{python}
+# Coordinate Reference System (Utah standard)
+PROJECT_CRS = "EPSG:3566"
+
+# Define State FIPS for Utah
+STATE_FIPS = "49"
+
+# Census API Key (Assumes stored in env or .env file)
+# from dotenv import load_dotenv
+# load_dotenv()
+```
+
+## Data Collection & Processing
+
+### Load and Dissolve TAZ Boundaries
+
+First, we read the specific Wasatch Front TAZ shapefile and dissolve it to create a single regional boundary polygon. This boundary will act as a spatial filter for retrieving Census data.
+
+```{python}
+# Define path to TAZ file
+taz_path = Path("_data/TAZ/WFv920_TAZ.shp")
+
+# Read TAZ shapefile
+# Note: We simulate reading the file. In a real run, ensure the path is correct.
+if taz_path.exists():
+    gdf_taz = gpd.read_file(taz_path).to_crs(PROJECT_CRS)
+
+    # Dissolve to get the regional boundary (Wasatch Front)
+    gdf_region = gdf_taz.dissolve()
+
+    print(f"Loaded {len(gdf_taz)} TAZs. Dissolved into regional boundary.")
+else:
+    # Fallback for demonstration if file is missing (e.g., creating a dummy box around Salt Lake)
+    print("TAZ file not found. Please ensure '_data/TAZ/WFv920_TAZ.shp' exists.")
+```
+
+```{python}
+gdf_region.explore()
+```
+
+### 2. Fetch Census Data (ACS 5-Year)
+
+We retrieve household income data from the American Community Survey (ACS) 2019-2023 at the Block Group level.
+
+```{python}
+# Define ACS Variables for Table B19001 (Household Income) and B19013 (Median Income)
+acs_variables = {
+    'B19001_001E': 'HH_TOTAL',      'B19001_002E': 'HH_LT_10K',
+    'B19001_003E': 'HH_10_15K',     'B19001_004E': 'HH_15_20K',
+    'B19001_005E': 'HH_20_25K',     'B19001_006E': 'HH_25_30K',
+    'B19001_007E': 'HH_30_35K',     'B19001_008E': 'HH_35_40K',
+    'B19001_009E': 'HH_40_45K',     'B19001_010E': 'HH_45_50K',
+    'B19001_011E': 'HH_50_60K',     'B19001_012E': 'HH_60_75K',
+    'B19001_013E': 'HH_75_100K',    'B19001_014E': 'HH_100_125K',
+    'B19001_015E': 'HH_125_150K',   'B19001_016E': 'HH_150_200K',
+    'B19001_017E': 'HH_GT_200K',    'B19013_001E': 'HH_MED_INC'
+}
+
+# Fetch ACS Data for all Block Groups in Utah
+print("Fetching ACS data...")
+df_acs_data = get_census(
+    dataset="acs/acs5",
+    year=2023,
+    variables=list(acs_variables.keys()),
+    params={
+        "for": "block group:*",
+        "in": f"state:{STATE_FIPS} county:*"
+    },
+    return_geoid=True,
+    guess_dtypes=True
+)
+
+# Rename columns
+df_acs_data = df_acs_data.rename(columns=acs_variables)
+print("Data fetch complete.")
+```
+
+### Spatial filter
+
+We download the spatial boundaries for Utah block groups and filter them to keep only those that have their centroid within the dissolved Wasatch Front regional boundary.
+
+```{python}
+# Fetch Block Group Geometries
+gdf_bg_geom = block_groups(state=STATE_FIPS, year=2023, cb=True).to_crs(PROJECT_CRS)
+gdf_bg_geom['centroid'] = gdf_bg_geom.geometry.centroid
+
+# Filter: Keep BGs whose centroids are within the Wasatch Front Region
+gdf_wf_bg = gpd.GeoDataFrame(
+    gdf_bg_geom, geometry='centroid'
+).sjoin(gdf_region, how='inner', predicate='within')
+
+valid_geoids = gdf_wf_bg['GEOID'].unique()
+print(f"Selected {len(valid_geoids)} Block Groups within the Wasatch Front Region.")
+```
+
+### Aggregation and Quartile Calculation
+
+We aggregate the household counts for the selected block groups and determine the income quartiles.
+
+The quartile classification logic is:
+
+Calculate cumulative percentage of households across income bins.
+1. **Group 1 (0-25%):** Lowest income bins up to the 25% threshold.
+2. **Group 2 (25-50%):** Bins from the 25% threshold up to 50%.
+3. **Group 3 (50-75%):** Bins from the 50% threshold up to 75%.
+4. **Group 4 (75-100%):** Bins above the 75% threshold.
+
+::: {.callout-note}
+If a bin crosses a threshold (e.g., starts at 23% and ends at 30%), it is assigned to the higher group (Group 2) to ensure the previous group is strictly the bottom tier.
+:::
+
+```{python}
+# 1. Prepare Lookup Table (Structure based on ACS variables)
+# Manually defining limits/midpoints to match the structure in provided prompt
+lookup_hhinc = pd.DataFrame({
+  "Income Category": [
+    "HH_LT_10K", "HH_10_15K", "HH_15_20K", "HH_20_25K", "HH_25_30K", "HH_30_35K",
+    "HH_35_40K", "HH_40_45K", "HH_45_50K", "HH_50_60K", "HH_60_75K",
+    "HH_75_100K", "HH_100_125K", "HH_125_150K", "HH_150_200K", "HH_GT_200K"
+  ],
+  "Lower Limit": [
+    0, 10000, 15000, 20000, 25000, 30000,
+    35000, 40000, 45000, 50000, 60000,
+    75000, 100000, 125000, 150000, 200000
+  ],
+  "Upper Limit": [
+    9999, 14999, 19999, 24999, 29999, 34999,
+    39999, 44999, 49999, 59999, 74999,
+    99999, 124999, 149999, 199999, np.inf
+  ]
+})
+
+# Compute midpoint and round it
+lookup_hhinc['Midpoint'] = (
+    (lookup_hhinc['Lower Limit'] + lookup_hhinc['Upper Limit']) / 2
+).round()
+
+# Replace infinite midpoint (last category) with 300000
+lookup_hhinc.loc[lookup_hhinc["Upper Limit"] == float('inf'), "Midpoint"] = 300000
+```
+
+Help me from here:
+
+```{python}
+# 1. Filter Census Data for Wasatch Front Region
+# Ensure we only use block groups within the valid GEOIDs identified earlier
+df_wf_data = df_acs_data[df_acs_data['GEOID'].isin(valid_geoids)].copy()
+
+# 2. Summarize (Sum) the columns directly
+# Since guess_dtypes=True was used, these columns are already numeric.
+income_cols = lookup_hhinc['Income Category'].tolist()
+income_sums = df_wf_data[income_cols].sum()
+```
+
+```{python}
+# 3. Create the Group Dataframe
+df_inc_group = lookup_hhinc.copy()
+df_inc_group['Region HH'] = df_inc_group['Income Category'].map(income_sums)
+
+# 4. Apply Quartile Methodology
+# Calculate percentage of households
+total_hh = df_inc_group['Region HH'].sum()
+df_inc_group['% HH'] = (df_inc_group['Region HH'] / total_hh * 100).round(1)
+
+# Calculate cumulative percentage
+df_inc_group['Cum % HH'] = (df_inc_group['Region HH'].cumsum() / total_hh * 100).round(1)
+
+# Assign income groups based on quartiles (0-25%, 25-50%, 50-75%, 75-100%)
+df_inc_group['Inc Group'] = pd.cut(
+    df_inc_group['Cum % HH'],
+    bins=[0, 25, 50, 75, 100],
+    labels=['Inc Group 1', 'Inc Group 2', 'Inc Group 3', 'Inc Group 4'],
+    include_lowest=True
+)
+
+# Calculate Weighted Product
+df_inc_group['HH_MedInc_Product'] = df_inc_group['Region HH'] * df_inc_group['Midpoint']
+
+print("Final Calculation Table:")
+df_inc_group
+```
+
+## Visualization
+
+We generate a bar chart visualizing the household distribution by income category, color-coded by the calculated income quartiles.
+
+```{python}
+#| out-width: "100%"
+
+# Prepare data for seaborn
+df_plot = df_inc_group.copy()
+
+# Create formatted labels
+# Replacing 'HH_' with nothing and '_' with ' - ' for cleaner text
+df_plot['Income Label'] = df_plot['Income Category'].str.replace('HH_', '').str.replace('_', ' - ')
+df_plot['index'] = range(len(df_plot))
+
+# Define colors for each income group
+palette = {'Inc Group 1': '#3498db', 'Inc Group 2': '#2ecc71',
+           'Inc Group 3': '#f39c12', 'Inc Group 4': '#e74c3c'}
+
+# Set seaborn style and context
+sns.set_style("whitegrid")
+sns.set_context("notebook")
+
+# FIX: Initialize a new figure to prevent duplicate legends/plots
+plt.figure(figsize=(10, 6))
+
+# Create barplot using seaborn
+sns.barplot(
+    data=df_plot,
+    x='index',
+    y='Region HH',
+    hue='Inc Group',
+    palette=palette,
+    legend=True,  # Ensure legend is created
+    dodge=False
+)
+
+# Customize plot
+plt.xlabel('Income Category', fontsize=11, fontweight='bold')
+plt.ylabel('Number of Households', fontsize=11, fontweight='bold')
+plt.title('Wasatch Front Household Income Distribution by Quartile',
+          fontsize=13, fontweight='bold', pad=20)
+
+# Format y-axis with comma separator
+plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:,.0f}'))
+
+# Set x-axis labels
+plt.xticks(range(len(df_plot)), df_plot['Income Label'],
+           rotation=45, ha='right', fontsize=9)
+
+# Customize legend
+plt.legend(loc='upper left', frameon=True, fontsize=10, title='')
+
+# Grid styling
+plt.grid(axis='y', alpha=0.3, linestyle='--')
+plt.gca().set_axisbelow(True)
+
+# Remove top and right spines for cleaner look
+sns.despine()
+
+plt.tight_layout()
+plt.show()
+```
+
+## Quantile Calculations
+
+### Method 1: Linear Interpolation
+
+```{python}
+# 1. Prepare Data for Interpolation
+# Ensure we have cumulative counts to locate the percentiles
+df_calc = df_inc_group.copy()
+df_calc['cum_hh'] = df_calc['Region HH'].cumsum()
+total_hh = df_calc['Region HH'].sum()
+
+# Handle the infinite upper limit for the last bin (GT 200k)
+# We assign a default width equal to the previous bin (50k) or a logical cap
+# to allow interpolation if a quartile falls in the highest bracket.
+last_width = df_calc.iloc[-2]['Upper Limit'] - df_calc.iloc[-2]['Lower Limit']
+df_calc['width'] = df_calc['Upper Limit'] - df_calc['Lower Limit']
+df_calc.loc[df_calc['width'] == np.inf, 'width'] = last_width * 2
+
+# 2. Iterate and Calculate Q1, Median, Q3
+quartiles = {'Q1': 0.25, 'Median': 0.50, 'Q3': 0.75}
+results = {}
+
+for label, q in quartiles.items():
+    # A. Determine the "rank" (the Nth household)
+    target_rank = q * total_hh
+
+    # B. Find the specific bin containing this household
+    bin_row = df_calc[df_calc['cum_hh'] >= target_rank].iloc[0]
+
+    # C. Identify interpolation parameters
+    lower_limit = bin_row['Lower Limit']
+    freq = bin_row['Region HH']
+    width = bin_row['width']
+
+    # Calculate previous cumulative frequency (subtract current freq from current cumsum)
+    prev_cum = bin_row['cum_hh'] - freq
+
+    # D. Apply Linear Interpolation Formula
+    # Value = Lower Limit + ((TargetRank - PrevCum) / Frequency) * Width
+    interpolated_val = lower_limit + ((target_rank - prev_cum) / freq) * width
+    results[label] = interpolated_val
+
+# 3. Output Results
+print("\n" + "="*40)
+print("WASATCH FRONT INCOME STATISTICS")
+print("="*40)
+print(f"Total Households:   {total_hh:,.0f}")
+print("-" * 40)
+print(f"1st Quartile (25%): ${results['Q1']:,.0f}")
+print(f"Median       (50%): ${results['Median']:,.0f}")
+print(f"3rd Quartile (75%): ${results['Q3']:,.0f}")
+print("="*40)
+```
+
+```{python}
+# ==============================================================================
+# VALIDATION: COMPARE INTERPOLATED MEDIAN VS. CENSUS MEDIAN (BLOCK GROUP LEVEL)
+# ==============================================================================
+
+def get_interpolated_median_for_row(row, bins_df):
+    """
+    Calculates the interpolated median for a single block group (row of data).
+    """
+    # 1. Extract counts for this block group
+    # Ensure the order matches bins_df
+    counts = row[bins_df['Income Category']].values
+
+    total_hh = counts.sum()
+    if total_hh == 0:
+        return np.nan
+
+    target_rank = 0.5 * total_hh
+
+    # 2. Calculate Cumulative Sums
+    cum_counts = counts.cumsum()
+
+    # 3. Find the bin containing the median
+    # argmax returns the first index where condition is True
+    bin_idx = (cum_counts >= target_rank).argmax()
+
+    # 4. Get Bin Parameters
+    lower = bins_df.iloc[bin_idx]['Lower Limit']
+    upper = bins_df.iloc[bin_idx]['Upper Limit']
+    freq = counts[bin_idx]
+
+    # Previous cumulative count
+    prev_cum = cum_counts[bin_idx-1] if bin_idx > 0 else 0
+
+    # 5. Handle Widths
+    if np.isinf(upper):
+        # Fallback for top bin: Use same width as previous bin
+        # (Standard simple assumption for open-ended top intervals)
+        prev_width = bins_df.iloc[bin_idx-1]['Upper Limit'] - bins_df.iloc[bin_idx-1]['Lower Limit']
+        width = prev_width
+    else:
+        width = upper - lower
+
+    # 6. Interpolate
+    # Value = Lower + ((Target - Prev_Cum) / Frequency) * Width
+    if freq == 0:
+        return lower # Should theoretically not happen if logic is correct
+
+    median_est = lower + ((target_rank - prev_cum) / freq) * width
+    return median_est
+
+# ------------------------------------------------------------------------------
+# 1. Apply Calculation to All Block Groups
+# ------------------------------------------------------------------------------
+print("Validating methodology across all block groups...")
+
+# Create a copy to work with
+df_validation = df_wf_data.copy()
+
+# Apply the function row by row
+# Note: This assumes 'lookup_hhinc' is defined as in your previous steps
+df_validation['Estimated_Median'] = df_validation.apply(
+    lambda row: get_interpolated_median_for_row(row, lookup_hhinc), axis=1
+)
+
+# ------------------------------------------------------------------------------
+# 2. Visualize Comparison (Scatter Plot)
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(10, 8))
+
+# Filter out invalid data for plotting (0 income or NaN)
+plot_data = df_validation[
+    (df_validation['HH_MED_INC'] > 0) &
+    (df_validation['Estimated_Median'] > 0)
+].copy()
+
+# Scatter Plot
+sns.scatterplot(
+    data=plot_data,
+    x='HH_MED_INC',
+    y='Estimated_Median',
+    alpha=0.5,
+    edgecolor=None,
+    color='#2980b9',
+    s=15,
+    label='Block Groups'
+)
+
+# Add 1:1 Reference Line (Perfect Accuracy)
+max_val = max(plot_data['HH_MED_INC'].max(), plot_data['Estimated_Median'].max())
+plt.plot([0, max_val], [0, max_val], color='red', linestyle='--', linewidth=2, label='Perfect Match (1:1)')
+
+# Formatting
+plt.title('Methodology Validation: Estimated vs. Actual Median Income\n(Linear Interpolation of Binned Data)',
+          fontsize=14, fontweight='bold', pad=15)
+plt.xlabel('Actual Census Median Income (B19013)', fontsize=12, fontweight='bold')
+plt.ylabel('Estimated Median (Linear Interpolation)', fontsize=12, fontweight='bold')
+
+# Axis formatting
+formatter = ticker.FuncFormatter(lambda x, p: f'${x/1000:,.0f}k')
+plt.gca().xaxis.set_major_formatter(formatter)
+plt.gca().yaxis.set_major_formatter(formatter)
+
+plt.legend()
+plt.grid(True, alpha=0.3)
+sns.despine()
+
+# Calculate Correlation for confidence
+corr = plot_data['HH_MED_INC'].corr(plot_data['Estimated_Median'])
+plt.text(0.05, 0.95, f'Correlation: {corr:.4f}', transform=plt.gca().transAxes,
+         fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+
+plt.tight_layout()
+plt.show()
+```
+
+### Method 2: Recursive Mean Method
+
+```{python}
+# ---------------------------------------------------------
+# RECURSIVE WEIGHTED MEAN METHOD FOR QUARTILES
+# ---------------------------------------------------------
+
+# 1. Calculate Estimated Median (Weighted Mean of Whole Distribution)
+total_hh = df_inc_group['Region HH'].sum()
+estimated_median = (df_inc_group['Region HH'] * df_inc_group['Midpoint']).sum() / total_hh
+
+# 2. Calculate Estimated Q1 (Weighted Mean of Lower Half)
+# Target Range: [Lowest Income -> Estimated Median]
+df_lower = df_inc_group.copy()
+
+# FIX: Explicitly cast to float to avoid FutureWarning when inserting decimal values
+df_lower['Region HH'] = df_lower['Region HH'].astype(float)
+df_lower['Midpoint'] = df_lower['Midpoint'].astype(float)
+
+# A. Handle the split bin
+mask_split = (df_lower['Lower Limit'] < estimated_median) & (df_lower['Upper Limit'] > estimated_median)
+
+if mask_split.any():
+    row = df_lower.loc[mask_split].iloc[0]
+    orig_width = row['Upper Limit'] - row['Lower Limit']
+
+    if np.isinf(orig_width):
+        orig_width = (row['Midpoint'] - row['Lower Limit']) * 2
+
+    new_width = estimated_median - row['Lower Limit']
+    ratio = new_width / orig_width
+
+    # Now safe to assign floats
+    df_lower.loc[mask_split, 'Region HH'] = row['Region HH'] * ratio
+    df_lower.loc[mask_split, 'Midpoint'] = (row['Lower Limit'] + estimated_median) / 2
+
+# B. Zero out bins completely ABOVE the median
+df_lower.loc[df_lower['Lower Limit'] >= estimated_median, 'Region HH'] = 0
+
+# C. Calculate Q1
+estimated_q1 = (df_lower['Region HH'] * df_lower['Midpoint']).sum() / df_lower['Region HH'].sum()
+
+
+# 3. Calculate Estimated Q3 (Weighted Mean of Upper Half)
+# Target Range: [Estimated Median -> Highest Income]
+df_upper = df_inc_group.copy()
+
+# FIX: Explicitly cast to float
+df_upper['Region HH'] = df_upper['Region HH'].astype(float)
+df_upper['Midpoint'] = df_upper['Midpoint'].astype(float)
+
+# A. Handle the split bin
+mask_split_up = (df_upper['Lower Limit'] < estimated_median) & (df_upper['Upper Limit'] > estimated_median)
+
+if mask_split_up.any():
+    row = df_upper.loc[mask_split_up].iloc[0]
+    orig_width = row['Upper Limit'] - row['Lower Limit']
+
+    eff_upper = row['Upper Limit']
+    if np.isinf(orig_width):
+        orig_width = (row['Midpoint'] - row['Lower Limit']) * 2
+        eff_upper = row['Lower Limit'] + orig_width
+
+    new_width = eff_upper - estimated_median
+    ratio = new_width / orig_width
+
+    # Now safe to assign floats
+    df_upper.loc[mask_split_up, 'Region HH'] = row['Region HH'] * ratio
+    df_upper.loc[mask_split_up, 'Midpoint'] = (estimated_median + eff_upper) / 2
+
+# B. Zero out bins completely BELOW the median
+df_upper.loc[df_upper['Upper Limit'] <= estimated_median, 'Region HH'] = 0
+
+# C. Calculate Q3
+estimated_q3 = (df_upper['Region HH'] * df_upper['Midpoint']).sum() / df_upper['Region HH'].sum()
+
+
+# 4. Output Results
+print("\n" + "="*50)
+print("WASATCH FRONT INCOME STATISTICS (RECURSIVE MEAN)")
+print("="*50)
+print(f"Total Households:   {total_hh:,.0f}")
+print("-" * 50)
+print(f"Estimated Q1:       ${estimated_q1:,.0f}")
+print(f"Estimated Median:   ${estimated_median:,.0f}")
+print(f"Estimated Q3:       ${estimated_q3:,.0f}")
+print("="*50)
+```
