@@ -219,56 +219,6 @@ print("Final Calculation Table:")
 df_inc_group
 ```
 
-```{python}
-# 1. Prepare Data for Interpolation
-# Ensure we have cumulative counts to locate the percentiles
-df_calc = df_inc_group.copy()
-df_calc['cum_hh'] = df_calc['Region HH'].cumsum()
-total_hh = df_calc['Region HH'].sum()
-
-# Handle the infinite upper limit for the last bin (GT 200k)
-# We assign a default width equal to the previous bin (50k) or a logical cap
-# to allow interpolation if a quartile falls in the highest bracket.
-last_width = df_calc.iloc[-2]['Upper Limit'] - df_calc.iloc[-2]['Lower Limit']
-df_calc['width'] = df_calc['Upper Limit'] - df_calc['Lower Limit']
-df_calc.loc[df_calc['width'] == np.inf, 'width'] = last_width
-
-# 2. Iterate and Calculate Q1, Median, Q3
-quartiles = {'Q1': 0.25, 'Median': 0.50, 'Q3': 0.75}
-results = {}
-
-for label, q in quartiles.items():
-    # A. Determine the "rank" (the Nth household)
-    target_rank = q * total_hh
-
-    # B. Find the specific bin containing this household
-    bin_row = df_calc[df_calc['cum_hh'] >= target_rank].iloc[0]
-
-    # C. Identify interpolation parameters
-    lower_limit = bin_row['Lower Limit']
-    freq = bin_row['Region HH']
-    width = bin_row['width']
-
-    # Calculate previous cumulative frequency (subtract current freq from current cumsum)
-    prev_cum = bin_row['cum_hh'] - freq
-
-    # D. Apply Linear Interpolation Formula
-    # Value = Lower Limit + ((TargetRank - PrevCum) / Frequency) * Width
-    interpolated_val = lower_limit + ((target_rank - prev_cum) / freq) * width
-    results[label] = interpolated_val
-
-# 3. Output Results
-print("\n" + "="*40)
-print("WASATCH FRONT INCOME STATISTICS")
-print("="*40)
-print(f"Total Households:   {total_hh:,.0f}")
-print("-" * 40)
-print(f"1st Quartile (25%): ${results['Q1']:,.0f}")
-print(f"Median       (50%): ${results['Median']:,.0f}")
-print(f"3rd Quartile (75%): ${results['Q3']:,.0f}")
-print("="*40)
-```
-
 ## Visualization
 
 We generate a bar chart visualizing the household distribution by income category, color-coded by the calculated income quartiles.
@@ -331,4 +281,263 @@ sns.despine()
 
 plt.tight_layout()
 plt.show()
+```
+
+## Quantile Calculations
+
+### Method 1: Linear Interpolation
+
+```{python}
+# 1. Prepare Data for Interpolation
+# Ensure we have cumulative counts to locate the percentiles
+df_calc = df_inc_group.copy()
+df_calc['cum_hh'] = df_calc['Region HH'].cumsum()
+total_hh = df_calc['Region HH'].sum()
+
+# Handle the infinite upper limit for the last bin (GT 200k)
+# We assign a default width equal to the previous bin (50k) or a logical cap
+# to allow interpolation if a quartile falls in the highest bracket.
+last_width = df_calc.iloc[-2]['Upper Limit'] - df_calc.iloc[-2]['Lower Limit']
+df_calc['width'] = df_calc['Upper Limit'] - df_calc['Lower Limit']
+df_calc.loc[df_calc['width'] == np.inf, 'width'] = last_width * 2
+
+# 2. Iterate and Calculate Q1, Median, Q3
+quartiles = {'Q1': 0.25, 'Median': 0.50, 'Q3': 0.75}
+results = {}
+
+for label, q in quartiles.items():
+    # A. Determine the "rank" (the Nth household)
+    target_rank = q * total_hh
+
+    # B. Find the specific bin containing this household
+    bin_row = df_calc[df_calc['cum_hh'] >= target_rank].iloc[0]
+
+    # C. Identify interpolation parameters
+    lower_limit = bin_row['Lower Limit']
+    freq = bin_row['Region HH']
+    width = bin_row['width']
+
+    # Calculate previous cumulative frequency (subtract current freq from current cumsum)
+    prev_cum = bin_row['cum_hh'] - freq
+
+    # D. Apply Linear Interpolation Formula
+    # Value = Lower Limit + ((TargetRank - PrevCum) / Frequency) * Width
+    interpolated_val = lower_limit + ((target_rank - prev_cum) / freq) * width
+    results[label] = interpolated_val
+
+# 3. Output Results
+print("\n" + "="*40)
+print("WASATCH FRONT INCOME STATISTICS")
+print("="*40)
+print(f"Total Households:   {total_hh:,.0f}")
+print("-" * 40)
+print(f"1st Quartile (25%): ${results['Q1']:,.0f}")
+print(f"Median       (50%): ${results['Median']:,.0f}")
+print(f"3rd Quartile (75%): ${results['Q3']:,.0f}")
+print("="*40)
+```
+
+```{python}
+# ==============================================================================
+# VALIDATION: COMPARE INTERPOLATED MEDIAN VS. CENSUS MEDIAN (BLOCK GROUP LEVEL)
+# ==============================================================================
+
+def get_interpolated_median_for_row(row, bins_df):
+    """
+    Calculates the interpolated median for a single block group (row of data).
+    """
+    # 1. Extract counts for this block group
+    # Ensure the order matches bins_df
+    counts = row[bins_df['Income Category']].values
+
+    total_hh = counts.sum()
+    if total_hh == 0:
+        return np.nan
+
+    target_rank = 0.5 * total_hh
+
+    # 2. Calculate Cumulative Sums
+    cum_counts = counts.cumsum()
+
+    # 3. Find the bin containing the median
+    # argmax returns the first index where condition is True
+    bin_idx = (cum_counts >= target_rank).argmax()
+
+    # 4. Get Bin Parameters
+    lower = bins_df.iloc[bin_idx]['Lower Limit']
+    upper = bins_df.iloc[bin_idx]['Upper Limit']
+    freq = counts[bin_idx]
+
+    # Previous cumulative count
+    prev_cum = cum_counts[bin_idx-1] if bin_idx > 0 else 0
+
+    # 5. Handle Widths
+    if np.isinf(upper):
+        # Fallback for top bin: Use same width as previous bin
+        # (Standard simple assumption for open-ended top intervals)
+        prev_width = bins_df.iloc[bin_idx-1]['Upper Limit'] - bins_df.iloc[bin_idx-1]['Lower Limit']
+        width = prev_width
+    else:
+        width = upper - lower
+
+    # 6. Interpolate
+    # Value = Lower + ((Target - Prev_Cum) / Frequency) * Width
+    if freq == 0:
+        return lower # Should theoretically not happen if logic is correct
+
+    median_est = lower + ((target_rank - prev_cum) / freq) * width
+    return median_est
+
+# ------------------------------------------------------------------------------
+# 1. Apply Calculation to All Block Groups
+# ------------------------------------------------------------------------------
+print("Validating methodology across all block groups...")
+
+# Create a copy to work with
+df_validation = df_wf_data.copy()
+
+# Apply the function row by row
+# Note: This assumes 'lookup_hhinc' is defined as in your previous steps
+df_validation['Estimated_Median'] = df_validation.apply(
+    lambda row: get_interpolated_median_for_row(row, lookup_hhinc), axis=1
+)
+
+# ------------------------------------------------------------------------------
+# 2. Visualize Comparison (Scatter Plot)
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(10, 8))
+
+# Filter out invalid data for plotting (0 income or NaN)
+plot_data = df_validation[
+    (df_validation['HH_MED_INC'] > 0) &
+    (df_validation['Estimated_Median'] > 0)
+].copy()
+
+# Scatter Plot
+sns.scatterplot(
+    data=plot_data,
+    x='HH_MED_INC',
+    y='Estimated_Median',
+    alpha=0.5,
+    edgecolor=None,
+    color='#2980b9',
+    s=15,
+    label='Block Groups'
+)
+
+# Add 1:1 Reference Line (Perfect Accuracy)
+max_val = max(plot_data['HH_MED_INC'].max(), plot_data['Estimated_Median'].max())
+plt.plot([0, max_val], [0, max_val], color='red', linestyle='--', linewidth=2, label='Perfect Match (1:1)')
+
+# Formatting
+plt.title('Methodology Validation: Estimated vs. Actual Median Income\n(Linear Interpolation of Binned Data)',
+          fontsize=14, fontweight='bold', pad=15)
+plt.xlabel('Actual Census Median Income (B19013)', fontsize=12, fontweight='bold')
+plt.ylabel('Estimated Median (Linear Interpolation)', fontsize=12, fontweight='bold')
+
+# Axis formatting
+formatter = ticker.FuncFormatter(lambda x, p: f'${x/1000:,.0f}k')
+plt.gca().xaxis.set_major_formatter(formatter)
+plt.gca().yaxis.set_major_formatter(formatter)
+
+plt.legend()
+plt.grid(True, alpha=0.3)
+sns.despine()
+
+# Calculate Correlation for confidence
+corr = plot_data['HH_MED_INC'].corr(plot_data['Estimated_Median'])
+plt.text(0.05, 0.95, f'Correlation: {corr:.4f}', transform=plt.gca().transAxes,
+         fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+
+plt.tight_layout()
+plt.show()
+```
+
+### Method 2: Recursive Mean Method
+
+```{python}
+# ---------------------------------------------------------
+# RECURSIVE WEIGHTED MEAN METHOD FOR QUARTILES
+# ---------------------------------------------------------
+
+# 1. Calculate Estimated Median (Weighted Mean of Whole Distribution)
+total_hh = df_inc_group['Region HH'].sum()
+estimated_median = (df_inc_group['Region HH'] * df_inc_group['Midpoint']).sum() / total_hh
+
+# 2. Calculate Estimated Q1 (Weighted Mean of Lower Half)
+# Target Range: [Lowest Income -> Estimated Median]
+df_lower = df_inc_group.copy()
+
+# FIX: Explicitly cast to float to avoid FutureWarning when inserting decimal values
+df_lower['Region HH'] = df_lower['Region HH'].astype(float)
+df_lower['Midpoint'] = df_lower['Midpoint'].astype(float)
+
+# A. Handle the split bin
+mask_split = (df_lower['Lower Limit'] < estimated_median) & (df_lower['Upper Limit'] > estimated_median)
+
+if mask_split.any():
+    row = df_lower.loc[mask_split].iloc[0]
+    orig_width = row['Upper Limit'] - row['Lower Limit']
+
+    if np.isinf(orig_width):
+        orig_width = (row['Midpoint'] - row['Lower Limit']) * 2
+
+    new_width = estimated_median - row['Lower Limit']
+    ratio = new_width / orig_width
+
+    # Now safe to assign floats
+    df_lower.loc[mask_split, 'Region HH'] = row['Region HH'] * ratio
+    df_lower.loc[mask_split, 'Midpoint'] = (row['Lower Limit'] + estimated_median) / 2
+
+# B. Zero out bins completely ABOVE the median
+df_lower.loc[df_lower['Lower Limit'] >= estimated_median, 'Region HH'] = 0
+
+# C. Calculate Q1
+estimated_q1 = (df_lower['Region HH'] * df_lower['Midpoint']).sum() / df_lower['Region HH'].sum()
+
+
+# 3. Calculate Estimated Q3 (Weighted Mean of Upper Half)
+# Target Range: [Estimated Median -> Highest Income]
+df_upper = df_inc_group.copy()
+
+# FIX: Explicitly cast to float
+df_upper['Region HH'] = df_upper['Region HH'].astype(float)
+df_upper['Midpoint'] = df_upper['Midpoint'].astype(float)
+
+# A. Handle the split bin
+mask_split_up = (df_upper['Lower Limit'] < estimated_median) & (df_upper['Upper Limit'] > estimated_median)
+
+if mask_split_up.any():
+    row = df_upper.loc[mask_split_up].iloc[0]
+    orig_width = row['Upper Limit'] - row['Lower Limit']
+
+    eff_upper = row['Upper Limit']
+    if np.isinf(orig_width):
+        orig_width = (row['Midpoint'] - row['Lower Limit']) * 2
+        eff_upper = row['Lower Limit'] + orig_width
+
+    new_width = eff_upper - estimated_median
+    ratio = new_width / orig_width
+
+    # Now safe to assign floats
+    df_upper.loc[mask_split_up, 'Region HH'] = row['Region HH'] * ratio
+    df_upper.loc[mask_split_up, 'Midpoint'] = (estimated_median + eff_upper) / 2
+
+# B. Zero out bins completely BELOW the median
+df_upper.loc[df_upper['Upper Limit'] <= estimated_median, 'Region HH'] = 0
+
+# C. Calculate Q3
+estimated_q3 = (df_upper['Region HH'] * df_upper['Midpoint']).sum() / df_upper['Region HH'].sum()
+
+
+# 4. Output Results
+print("\n" + "="*50)
+print("WASATCH FRONT INCOME STATISTICS (RECURSIVE MEAN)")
+print("="*50)
+print(f"Total Households:   {total_hh:,.0f}")
+print("-" * 50)
+print(f"Estimated Q1:       ${estimated_q1:,.0f}")
+print(f"Estimated Median:   ${estimated_median:,.0f}")
+print(f"Estimated Q3:       ${estimated_q3:,.0f}")
+print("="*50)
 ```
